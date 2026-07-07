@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Tweet Downloader</title>
+<style>
+  :root { --amber:#F59E0B; --bg:#0A0B0F; --card:#14161C; --line:#262A33; --txt:#E8EAED; --dim:#9AA0AB; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif; }
+  .wrap { max-width:720px; margin:0 auto; padding:28px 18px 60px; }
+  h1 { font-size:26px; font-weight:800; margin:0 0 4px; }
+  h1 span { color:var(--amber); }
+  .sub { color:var(--dim); margin:0 0 20px; font-size:13px; }
+  .sub b { color:var(--txt); }
+  .row { display:flex; gap:8px; }
+  input { flex:1; background:var(--card); border:1px solid var(--line); color:var(--txt); border-radius:10px; padding:12px 14px; font-size:15px; }
+  input:focus { outline:none; border-color:var(--amber); }
+  button { cursor:pointer; border:none; border-radius:10px; font-weight:700; font-size:14px; padding:12px 16px; }
+  .go { background:var(--amber); color:#1a1204; }
+  .go:disabled { opacity:.5; cursor:default; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; margin-top:20px; display:none; }
+  .who { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+  .who img { width:40px; height:40px; border-radius:50%; }
+  .who .n { font-weight:700; } .who .h { color:var(--dim); font-size:13px; }
+  .text { white-space:pre-wrap; font-size:16px; margin:10px 0; }
+  .meta { color:var(--dim); font-size:13px; display:flex; gap:14px; flex-wrap:wrap; margin-bottom:14px; }
+  .imgs { display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:8px; margin:12px 0; }
+  .imgs img { width:100%; border-radius:8px; border:1px solid var(--line); }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+  .btns button, .btns a { background:#1E2129; color:var(--txt); border:1px solid var(--line); border-radius:9px; padding:9px 13px; font-size:13px; font-weight:600; text-decoration:none; display:inline-block; }
+  .btns button:hover, .btns a:hover { border-color:var(--amber); color:var(--amber); }
+  .note { color:var(--dim); font-size:12.5px; margin-top:14px; border-top:1px solid var(--line); padding-top:12px; }
+  .err { color:#F87171; margin-top:16px; display:none; }
+  .rtl { direction:rtl; text-align:right; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span>Tweet</span> Downloader</h1>
+  <p class="sub">Paste an X/Twitter link → get the <b>full text, images, video, and all info</b>. <span class="rtl">حمّل نص وصور وفيديو التغريدة</span></p>
+  <div class="row">
+    <input id="url" type="text" placeholder="https://x.com/user/status/123…  or  https://x.com/i/status/…" />
+    <button class="go" id="go">Get</button>
+  </div>
+  <div class="err" id="err"></div>
+
+  <div class="card" id="card">
+    <div class="who" id="who"></div>
+    <div class="text" id="text"></div>
+    <div class="meta" id="meta"></div>
+    <div class="imgs" id="imgs"></div>
+    <div class="btns" id="btns"></div>
+    <div class="note" id="note"></div>
+  </div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let current = null;
+
+async function go() {
+  const url = $("url").value.trim();
+  if (!url) return;
+  $("go").disabled = true; $("go").textContent = "…";
+  $("err").style.display = "none"; $("card").style.display = "none";
+  try {
+    const r = await fetch("/api/fetch", { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify({ url }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "failed");
+    current = d;
+    render(d);
+  } catch (e) {
+    $("err").textContent = e.message; $("err").style.display = "block";
+  } finally {
+    $("go").disabled = false; $("go").textContent = "Get";
+  }
+}
+
+function download(name, text, type="text/plain") {
+  const b = new Blob([text], { type });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(b); a.download = name; a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function markdown(d) {
+  let m = `# Tweet by @${d.author?.handle||"?"} (${d.author?.name||""})\n\n`;
+  m += `- URL: https://x.com/i/status/${d.id}\n- Posted: ${d.created_at||"?"}\n`;
+  m += `- Likes: ${d.stats?.likes??"?"} · Thread: ${d.stats?.retweets??"?"}\n`;
+  m += `- Images: ${d.images.length} · Video: ${d.has_video?"yes":"no"}\n\n## Text\n\n${d.text||"(none)"}\n`;
+  if (d.images.length) m += `\n## Image URLs\n\n` + d.images.map(u=>`- ${u}?name=orig`).join("\n") + "\n";
+  m += `\n## Comments\n\n_Not included — X needs login for full replies._\n`;
+  return m;
+}
+
+function render(d) {
+  $("who").innerHTML = d.author
+    ? `<img src="${d.author.avatar||""}" onerror="this.style.display='none'"/><div><div class="n">${esc(d.author.name||"")}</div><div class="h">@${esc(d.author.handle||"")}</div></div>`
+    : "";
+  $("text").textContent = d.text || "(no text)";
+  const dt = d.created_at ? new Date(d.created_at).toLocaleString() : "?";
+  $("meta").innerHTML = `<span>❤ ${d.stats?.likes??"?"}</span><span>💬 ${d.stats?.replies??d.stats?.retweets??"?"}</span><span>🕐 ${dt}</span>`;
+  $("imgs").innerHTML = d.images.map(u=>`<img src="${esc(u)}?name=small" loading="lazy"/>`).join("");
+  const b = [];
+  b.push(`<button onclick="navigator.clipboard.writeText(current.text||'');this.textContent='Copied ✓'">Copy text</button>`);
+  b.push(`<button onclick="download('tweet-${d.id}.txt', current.text||'')">Text .txt</button>`);
+  b.push(`<button onclick="download('tweet-${d.id}.md', markdown(current))">AI markdown</button>`);
+  b.push(`<button onclick="download('tweet-${d.id}.json', JSON.stringify(current.raw,null,2),'application/json')">All info .json</button>`);
+  d.images.forEach((u,i)=> b.push(`<a href="/api/image?u=${encodeURIComponent(u)}">Image ${i+1}</a>`));
+  if (d.has_video) b.push(`<a href="/api/video?url=${encodeURIComponent('https://x.com/i/status/'+d.id)}">Download video</a>`);
+  $("btns").innerHTML = b.join("");
+  $("note").innerHTML = `Comments/replies aren't downloadable without an X login — this pulls everything the public embed exposes. <b>AI markdown</b> gives a clean file for Claude.`;
+  $("card").style.display = "block";
+}
+function esc(s){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+$("go").onclick = go;
+$("url").addEventListener("keydown", e=>{ if(e.key==="Enter") go(); });
+</script>
+</body>
+</html>

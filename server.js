@@ -13,6 +13,27 @@ const app = express();
 app.use(express.json({ limit: "256kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
+// The port is reachable from the internet — keep strangers from turning this
+// into a free download farm. Cheap fixed-window per-IP limiter, no deps.
+const hits = new Map(); // ip → { n, windowStart }
+function rateLimit(max) {
+  return (req, res, next) => {
+    const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip;
+    const now = Date.now();
+    const h = hits.get(ip);
+    if (!h || now - h.windowStart > 60_000) {
+      hits.set(ip, { n: 1, windowStart: now });
+      return next();
+    }
+    if (++h.n > max) return res.status(429).json({ error: "Slow down — try again in a minute." });
+    next();
+  };
+}
+setInterval(() => {
+  const cutoff = Date.now() - 120_000;
+  for (const [ip, h] of hits) if (h.windowStart < cutoff) hits.delete(ip);
+}, 300_000).unref();
+
 const DL = path.join(__dirname, "downloads");
 fs.mkdirSync(DL, { recursive: true });
 const YTDLP = path.join(os.homedir(), "bin", "yt-dlp");
@@ -40,6 +61,7 @@ async function fetchTweet(id) {
     `&token=${synToken(id)}&lang=en`;
   const r = await fetch(url, {
     headers: { "User-Agent": UA, Accept: "application/json" },
+    signal: AbortSignal.timeout(15_000),
   });
   if (!r.ok) throw new Error(`syndication HTTP ${r.status}`);
   return r.json();
@@ -82,7 +104,7 @@ function normalize(t) {
   };
 }
 
-app.post("/api/fetch", async (req, res) => {
+app.post("/api/fetch", rateLimit(20), async (req, res) => {
   const id = tweetId(req.body?.url);
   if (!id) return res.status(400).json({ error: "Not a valid tweet link or ID" });
   try {
@@ -94,16 +116,17 @@ app.post("/api/fetch", async (req, res) => {
 });
 
 // Proxy an image so the browser can force-download it (avoids CORS).
-app.get("/api/image", async (req, res) => {
+app.get("/api/image", rateLimit(60), async (req, res) => {
   const u = String(req.query.u || "");
   if (!/^https:\/\/pbs\.twimg\.com\//.test(u))
     return res.status(400).send("bad image url");
   try {
     const r = await fetch(u.includes("?") ? u : u + "?name=orig", {
       headers: { "User-Agent": UA },
+      signal: AbortSignal.timeout(20_000),
     });
     if (!r.ok) return res.status(502).send("fetch failed");
-    const name = (u.split("/").pop() || "image").split("?")[0];
+    const name = ((u.split("/").pop() || "image").split("?")[0]).replace(/[^\w.-]/g, "_");
     res.setHeader("Content-Type", r.headers.get("content-type") || "image/jpeg");
     res.setHeader("Content-Disposition", `attachment; filename="${name}.jpg"`);
     const buf = Buffer.from(await r.arrayBuffer());
@@ -114,9 +137,13 @@ app.get("/api/image", async (req, res) => {
 });
 
 // Download the video via yt-dlp and stream the file back.
-app.get("/api/video", async (req, res) => {
+let videoJobs = 0;
+app.get("/api/video", rateLimit(5), async (req, res) => {
   const id = tweetId(req.query.url);
   if (!id) return res.status(400).json({ error: "bad url" });
+  if (videoJobs >= 2)
+    return res.status(429).json({ error: "Busy with other downloads — try again shortly." });
+  videoJobs++;
   const out = path.join(DL, `${id}.%(ext)s`);
   const args = [
     `https://x.com/i/status/${id}`,
@@ -128,6 +155,7 @@ app.get("/api/video", async (req, res) => {
   ];
   if (fs.existsSync(COOKIES)) args.push("--cookies", COOKIES);
   execFile(YTDLP, args, { timeout: 120000 }, async (err) => {
+    videoJobs--;
     if (err) {
       return res.status(502).json({
         error:

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KDL — Android Downloader App</title>
+<style>
+  body{margin:0;font-family:system-ui,sans-serif;background:#141210;color:#eee;
+       display:flex;flex-direction:column;align-items:center;justify-content:center;
+       min-height:100vh;text-align:center;padding:24px;box-sizing:border-box}
+  h1{color:#F5A623;font-size:2.4rem;margin:0 0 4px}
+  p{color:#B8AFA3;max-width:420px;line-height:1.6}
+  a.btn{display:inline-block;background:#F5A623;color:#141210;font-weight:800;
+        padding:16px 42px;border-radius:12px;text-decoration:none;font-size:1.2rem;margin:22px 0 8px}
+  .steps{color:#8a8175;font-size:.9rem;max-width:420px;line-height:1.8}
+  .v{color:#5C554C;font-size:.8rem;margin-top:18px}
+</style>
+</head>
+<body>
+  <h1>KDL ⬇</h1>
+  <p>X/Twitter video (MP4) + YouTube MP3 — in one Android app.<br>
+     تطبيق أندرويد واحد: فيديو X + يوتيوب MP3</p>
+  <a class="btn" href="/kdl.apk">Download APK ⬇ تحميل التطبيق</a>
+  <p class="steps">
+    1. Download the APK — حمّل الملف<br>
+    2. Open it → allow "install unknown apps" — اسمح بتثبيت التطبيقات<br>
+    3. Paste any X or YouTube link → Download — الصق الرابط وحمّل<br>
+    Tip: share a link from the X/YouTube app straight to KDL
+  </p>
+  <p class="v" id="ver"></p>
+  <script>fetch('/kdl-version.json').then(r=>r.json()).then(v=>{
+    document.getElementById('ver').textContent='v'+v.versionName+' ('+v.versionCode+') — updated '+v.date;
+  }).catch(()=>{});</script>
+</body>
+</html>

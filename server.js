@@ -173,5 +173,36 @@ app.get("/api/video", rateLimit(5), async (req, res) => {
   });
 });
 
+// YouTube → MP3 via yt-dlp audio extraction (used by the Android app).
+app.get("/api/mp3", rateLimit(5), async (req, res) => {
+  const u = String(req.query.url || "");
+  const m = u.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([\w-]{11})/);
+  if (!m) return res.status(400).json({ error: "Not a valid YouTube link" });
+  if (videoJobs >= 2)
+    return res.status(429).json({ error: "Busy with other downloads — try again shortly." });
+  videoJobs++;
+  const id = m[1];
+  const out = path.join(DL, `yt-${id}.%(ext)s`);
+  const args = [
+    `https://www.youtube.com/watch?v=${id}`,
+    "-o", out,
+    "-x", "--audio-format", "mp3", "--audio-quality", "0",
+    "--no-playlist",
+    "--force-overwrites",
+    "--ffmpeg-location", path.join(os.homedir(), "bin"),
+  ];
+  execFile(YTDLP, args, { timeout: 300000 }, async (err) => {
+    videoJobs--;
+    if (err) return res.status(502).json({ error: "MP3 download failed — video may be blocked or age-restricted." });
+    try {
+      const file = path.join(DL, `yt-${id}.mp3`);
+      if (!fs.existsSync(file)) return res.status(404).json({ error: "no file produced" });
+      res.download(file, `youtube-${id}.mp3`, () => fs.unlink(file, () => {}));
+    } catch {
+      res.status(500).json({ error: "read failed" });
+    }
+  });
+});
+
 const PORT = parseInt(process.env.PORT || "4310", 10);
 app.listen(PORT, () => console.log(`twitter-dl on http://localhost:${PORT}`));

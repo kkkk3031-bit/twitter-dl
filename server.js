@@ -38,6 +38,7 @@ const DL = path.join(__dirname, "downloads");
 fs.mkdirSync(DL, { recursive: true });
 const YTDLP = path.join(os.homedir(), "bin", "yt-dlp");
 const COOKIES = path.join(os.homedir(), ".config", "twdl", "cookies.txt");
+const YT_RAILWAY = "https://youtube-mp3-downloader-production-c1e2.up.railway.app";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
@@ -173,35 +174,59 @@ app.get("/api/video", rateLimit(5), async (req, res) => {
   });
 });
 
-// YouTube → MP3 via yt-dlp audio extraction (used by the Android app).
+// YouTube → MP3 via yt-dlp (Railway API primary, local fallback).
 app.get("/api/mp3", rateLimit(5), async (req, res) => {
   const u = String(req.query.url || "");
   const m = u.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([\w-]{11})/);
   if (!m) return res.status(400).json({ error: "Not a valid YouTube link" });
-  if (videoJobs >= 2)
-    return res.status(429).json({ error: "Busy with other downloads — try again shortly." });
-  videoJobs++;
   const id = m[1];
-  const out = path.join(DL, `yt-${id}.%(ext)s`);
-  const args = [
-    `https://www.youtube.com/watch?v=${id}`,
-    "-o", out,
-    "-x", "--audio-format", "mp3", "--audio-quality", "0",
-    "--no-playlist",
-    "--force-overwrites",
-    "--ffmpeg-location", path.join(os.homedir(), "bin"),
-  ];
-  execFile(YTDLP, args, { timeout: 300000 }, async (err) => {
-    videoJobs--;
-    if (err) return res.status(502).json({ error: "MP3 download failed — video may be blocked or age-restricted." });
-    try {
+  // Railway job flow (fast, has cookies)
+  try {
+    const r = await fetch(YT_RAILWAY + "/start", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: u }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const j = await r.json();
+    const jobId = j.job_id;
+    if (!jobId) throw new Error("no job_id");
+    for (let i = 0; i < 150; i++) {
+      await new Promise(r2 => setTimeout(r2, 2000));
+      const s = await fetch(YT_RAILWAY + "/status/" + jobId, { signal: AbortSignal.timeout(10000) });
+      const st = await s.json();
+      if (st.status === "done") {
+        const dl = await fetch(YT_RAILWAY + "/download/" + jobId, { signal: AbortSignal.timeout(120000) });
+        if (!dl.ok) throw new Error("download failed");
+        const buf = Buffer.from(await dl.arrayBuffer());
+        const fname = st.filename || `youtube-${id}.mp3`;
+        res.setHeader("Content-Type", "audio/mpeg");
+        res.setHeader("Content-Disposition", `attachment; filename="${fname}"`);
+        return res.end(buf);
+      }
+      if (st.status === "error") throw new Error(st.error || "convert failed");
+    }
+    throw new Error("timeout");
+  } catch (e) {
+    // Railway failed — try local yt-dlp as fallback
+    if (videoJobs >= 2)
+      return res.status(429).json({ error: "Busy — try again shortly." });
+    videoJobs++;
+    const out = path.join(DL, `yt-${id}.%(ext)s`);
+    const args = [
+      `https://www.youtube.com/watch?v=${id}`,
+      "-o", out, "-x", "--audio-format", "mp3", "--audio-quality", "0",
+      "--no-playlist", "--force-overwrites",
+      "--ffmpeg-location", path.join(os.homedir(), "bin"),
+    ];
+    if (fs.existsSync(COOKIES)) args.push("--cookies", COOKIES);
+    execFile(YTDLP, args, { timeout: 300000 }, (err) => {
+      videoJobs--;
+      if (err) return res.status(502).json({ error: "MP3 download failed: " + e.message });
       const file = path.join(DL, `yt-${id}.mp3`);
       if (!fs.existsSync(file)) return res.status(404).json({ error: "no file produced" });
       res.download(file, `youtube-${id}.mp3`, () => fs.unlink(file, () => {}));
-    } catch {
-      res.status(500).json({ error: "read failed" });
-    }
-  });
+    });
+  }
 });
 
 const PORT = parseInt(process.env.PORT || "4310", 10);

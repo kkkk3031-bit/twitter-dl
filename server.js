@@ -189,7 +189,9 @@ app.get("/api/image", rateLimit(60), async (req, res) => {
 // Download the video: fast path streams the direct video.twimg.com mp4 that
 // fxtwitter resolves (no re-download through yt-dlp); yt-dlp is the fallback.
 let videoJobs = 0;
-app.get("/api/video", rateLimit(5), async (req, res) => {
+// 15/min: the app's paste-retry + stall-watchdog re-enqueues can burn
+// several hits per download; 5 was 429-ing real phones mid-flow.
+app.get("/api/video", rateLimit(15), async (req, res) => {
   const id = tweetId(req.query.url);
   if (!id) return res.status(400).json({ error: "bad url" });
   try {

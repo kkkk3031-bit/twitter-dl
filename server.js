@@ -195,17 +195,25 @@ app.get("/api/video", rateLimit(5), async (req, res) => {
   try {
     const direct = await fxVideoUrl(id);
     if (direct && /^https:\/\/video\.twimg\.com\//.test(direct)) {
+      // Timeout covers connecting to the CDN only — never the body stream,
+      // or slow phone downloads get cut mid-file and look like a freeze.
+      const ac = new AbortController();
+      const connTimer = setTimeout(() => ac.abort(), 30_000);
       const r = await fetch(direct, {
         headers: { "User-Agent": UA },
-        signal: AbortSignal.timeout(30_000),
+        signal: ac.signal,
       });
+      clearTimeout(connTimer);
       if (r.ok && r.body) {
         res.setHeader("Content-Type", "video/mp4");
         res.setHeader("Content-Disposition", `attachment; filename="tweet-${id}.mp4"`);
         const len = r.headers.get("content-length");
         if (len) res.setHeader("Content-Length", len);
         const { Readable } = require("stream");
-        return Readable.fromWeb(r.body).pipe(res);
+        const body = Readable.fromWeb(r.body);
+        body.on("error", () => res.destroy());
+        res.on("close", () => body.destroy()); // phone gave up → stop pulling from CDN
+        return body.pipe(res);
       }
     }
   } catch {} // fall through to yt-dlp

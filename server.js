@@ -194,6 +194,10 @@ app.get("/api/video", rateLimit(5), async (req, res) => {
   if (!id) return res.status(400).json({ error: "bad url" });
   try {
     const direct = await fxVideoUrl(id);
+    // fx loaded the tweet and found no video at all — yt-dlp can't do better
+    // (no login cookies), so answer honestly instead of "needs login".
+    if (direct === null)
+      return res.status(404).json({ error: "This tweet has no video — it's text or photos only." });
     if (direct && /^https:\/\/video\.twimg\.com\//.test(direct)) {
       // Timeout covers connecting to the CDN only — never the body stream,
       // or slow phone downloads get cut mid-file and look like a freeze.

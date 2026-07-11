@@ -77,7 +77,9 @@ function normalize(t) {
   push(t.mediaDetails);
   push(t.photos);
   (t.photos || []).forEach((p) => p?.url && photos.push(p.url));
-  const uniqPhotos = [...new Set(photos)];
+  // t.photos sometimes carries the tweet's t.co permalink — keep real images only.
+  const uniqPhotos = [...new Set(photos)].filter((u) =>
+    /^https:\/\/pbs\.twimg\.com\//.test(u));
   const hasVideo =
     (t.mediaDetails || []).some((m) => m.type === "video" || m.type === "animated_gif") ||
     !!t.video;

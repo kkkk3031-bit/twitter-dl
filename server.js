@@ -68,6 +68,48 @@ async function fetchTweet(id) {
   return r.json();
 }
 
+// Sensitive-flagged tweets come back as an empty TweetTombstone from the
+// syndication endpoint; the fxtwitter API still serves them, including direct
+// video.twimg.com mp4 URLs.
+async function fetchFx(id) {
+  const r = await fetch(`https://api.fxtwitter.com/status/${id}`, {
+    headers: { "User-Agent": UA, Accept: "application/json" },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!r.ok) throw new Error(`fxtwitter HTTP ${r.status}`);
+  const j = await r.json();
+  if (!j.tweet) throw new Error("tweet unavailable");
+  return j.tweet;
+}
+
+function normalizeFx(t) {
+  const media = t.media?.all || [];
+  return {
+    id: t.id,
+    text: t.text || "",
+    author: t.author
+      ? { name: t.author.name, handle: t.author.screen_name, avatar: t.author.avatar_url }
+      : null,
+    created_at: t.created_at || null,
+    stats: { likes: t.likes ?? null, retweets: t.retweets ?? null, replies: t.replies ?? null },
+    images: media.filter((m) => m.type === "photo").map((m) => m.url),
+    has_video: media.some((m) => m.type === "video" || m.type === "gif"),
+    quoted: t.quote ? { text: t.quote.text, handle: t.quote.author?.screen_name } : null,
+    comments_available: false,
+    raw: t,
+  };
+}
+
+// Highest-bitrate direct mp4 for a tweet, or null if it has no video.
+async function fxVideoUrl(id) {
+  const t = await fetchFx(id);
+  const vids = (t.media?.all || []).filter((m) => m.type === "video" || m.type === "gif");
+  if (!vids.length) return null;
+  const formats = (vids[0].formats || []).filter((f) => f.container === "mp4");
+  if (formats.length) return formats.reduce((a, b) => ((b.bitrate || 0) > (a.bitrate || 0) ? b : a)).url;
+  return vids[0].url || null;
+}
+
 function normalize(t) {
   const photos = [];
   const push = (arr) =>
@@ -111,10 +153,15 @@ app.post("/api/fetch", rateLimit(20), async (req, res) => {
   const id = tweetId(req.body?.url);
   if (!id) return res.status(400).json({ error: "Not a valid tweet link or ID" });
   try {
-    const data = normalize(await fetchTweet(id));
-    res.json({ ok: true, ...data });
+    const t = await fetchTweet(id);
+    if (t?.__typename === "TweetTombstone") throw new Error("tombstone");
+    res.json({ ok: true, ...normalize(t) });
   } catch (err) {
-    res.status(502).json({ error: `Couldn't read that tweet (${err.message}). It may be private or deleted.` });
+    try {
+      res.json({ ok: true, ...normalizeFx(await fetchFx(id)) });
+    } catch {
+      res.status(502).json({ error: `Couldn't read that tweet (${err.message}). It may be private or deleted.` });
+    }
   }
 });
 
@@ -139,11 +186,29 @@ app.get("/api/image", rateLimit(60), async (req, res) => {
   }
 });
 
-// Download the video via yt-dlp and stream the file back.
+// Download the video: fast path streams the direct video.twimg.com mp4 that
+// fxtwitter resolves (no re-download through yt-dlp); yt-dlp is the fallback.
 let videoJobs = 0;
 app.get("/api/video", rateLimit(5), async (req, res) => {
   const id = tweetId(req.query.url);
   if (!id) return res.status(400).json({ error: "bad url" });
+  try {
+    const direct = await fxVideoUrl(id);
+    if (direct && /^https:\/\/video\.twimg\.com\//.test(direct)) {
+      const r = await fetch(direct, {
+        headers: { "User-Agent": UA },
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (r.ok && r.body) {
+        res.setHeader("Content-Type", "video/mp4");
+        res.setHeader("Content-Disposition", `attachment; filename="tweet-${id}.mp4"`);
+        const len = r.headers.get("content-length");
+        if (len) res.setHeader("Content-Length", len);
+        const { Readable } = require("stream");
+        return Readable.fromWeb(r.body).pipe(res);
+      }
+    }
+  } catch {} // fall through to yt-dlp
   if (videoJobs >= 2)
     return res.status(429).json({ error: "Busy with other downloads — try again shortly." });
   videoJobs++;

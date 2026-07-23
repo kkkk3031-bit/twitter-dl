@@ -14,15 +14,20 @@ app.use(express.json({ limit: "256kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 // The port is reachable from the internet — keep strangers from turning this
-// into a free download farm. Cheap fixed-window per-IP limiter, no deps.
-const hits = new Map(); // ip → { n, windowStart }
+// into a free download farm. Cheap fixed-window limiter, no deps.
+// Bucketed per IP AND per route: one shared per-IP counter meant every
+// endpoint's requests were charged to the same tally and then compared against
+// that endpoint's own max, so TikTok downloads ate Instagram's budget and the
+// strictest route (/api/mp3, 5) throttled everything after 5 calls of any kind.
+const hits = new Map(); // "ip|route" → { n, windowStart }
 function rateLimit(max) {
   return (req, res, next) => {
     const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip;
+    const key = ip + "|" + req.path;
     const now = Date.now();
-    const h = hits.get(ip);
+    const h = hits.get(key);
     if (!h || now - h.windowStart > 60_000) {
-      hits.set(ip, { n: 1, windowStart: now });
+      hits.set(key, { n: 1, windowStart: now });
       return next();
     }
     if (++h.n > max) return res.status(429).json({ error: "Slow down — try again in a minute." });
@@ -31,7 +36,7 @@ function rateLimit(max) {
 }
 setInterval(() => {
   const cutoff = Date.now() - 120_000;
-  for (const [ip, h] of hits) if (h.windowStart < cutoff) hits.delete(ip);
+  for (const [key, h] of hits) if (h.windowStart < cutoff) hits.delete(key);
 }, 300_000).unref();
 
 const DL = path.join(__dirname, "downloads");
@@ -255,10 +260,12 @@ app.get("/api/video", rateLimit(15), async (req, res) => {
   });
 });
 
-// TikTok → MP4 via yt-dlp. Unlike X, the public page carries the media URL, so
-// this needs no cookies. Short share links (vm./vt.) redirect to the canonical
-// /video/<id> URL and yt-dlp follows them itself, so they pass through as-is.
-function tiktokUrl(input) {
+// TikTok and Instagram → MP4 via yt-dlp. Unlike X, both serve the media URL on
+// the public page, so neither needs cookies and one handler covers both.
+// Accepts the host and its subdomains only, so a lookalike like
+// eviltiktok.com is rejected; TikTok's vm./vt. share shorteners are
+// subdomains, and yt-dlp follows their redirect itself.
+function siteUrl(input, hostRe) {
   const s = String(input || "").trim();
   let u;
   try {
@@ -267,19 +274,53 @@ function tiktokUrl(input) {
     return null;
   }
   if (!/^https?:$/.test(u.protocol)) return null;
-  if (!/(^|\.)tiktok\.com$/i.test(u.hostname)) return null;
+  if (!hostRe.test(u.hostname)) return null;
   return u.toString();
 }
 
-app.get("/api/tiktok", rateLimit(15), async (req, res) => {
-  const url = tiktokUrl(req.query.url);
-  if (!url) return res.status(400).json({ error: "Not a valid TikTok link" });
+// Maps a yt-dlp failure to an honest HTTP answer. A photo-only post is a
+// correct answer, not a failure — say so plainly instead of blaming the
+// network (same honesty as /api/video for text-only tweets).
+function ytdlpError(res, stderr, site) {
+  const msg = String(stderr || "");
+  if (/no video in this post|there is no video/i.test(msg))
+    return res.status(404).json({ error: `This ${site} post has no video — it's a photo.` });
+  if (/login required|requested content is not available|rate.?limit/i.test(msg))
+    return res.status(502).json({
+      error: `${site} is asking for a login for this one — it may be private or age-restricted.`,
+    });
+  return res.status(502).json({
+    error: `${site} download failed — the video may be private, removed, or region-locked.`,
+  });
+}
+
+// Hand back the signed CDN URL instead of the bytes, so the phone downloads
+// straight from the source in one hop — no VPS bandwidth, no waiting for us to
+// pull the file first. Only offered for Instagram: its signed links serve from
+// any IP with no headers, while TikTok's CDN 403s anything but the session that
+// extracted them (verified both ways), which is why /api/tiktok streams instead.
+function ytdlpDirectUrl(res, url, site) {
+  if (videoJobs >= 2)
+    return res.status(429).json({ error: "Busy with other downloads — try again shortly." });
+  videoJobs++;
+  const args = [url, "-g", "-f", "mp4/best", "--no-playlist", "--no-warnings"];
+  execFile(YTDLP, args, { timeout: 60000 }, (err, stdout, stderr) => {
+    videoJobs--;
+    if (err) return ytdlpError(res, stderr, site);
+    const direct = String(stdout || "").trim().split("\n")[0];
+    if (!/^https:\/\//.test(direct))
+      return res.status(502).json({ error: `${site}: no direct link found` });
+    res.json({ ok: true, url: direct });
+  });
+}
+
+function ytdlpToClient(res, url, site) {
   if (videoJobs >= 2)
     return res.status(429).json({ error: "Busy with other downloads — try again shortly." });
   videoJobs++;
   // Per-job dir: the filename comes from yt-dlp metadata, so there is no
   // predictable name to collide on or to clean up by prefix.
-  const job = path.join(DL, `tt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const job = path.join(DL, `dl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   fs.mkdirSync(job, { recursive: true });
   const cleanup = () => fs.rm(job, { recursive: true, force: true }, () => {});
   const args = [
@@ -287,19 +328,17 @@ app.get("/api/tiktok", rateLimit(15), async (req, res) => {
     "-o", path.join(job, "%(uploader)s-%(id)s.%(ext)s"),
     "-f", "mp4/best",
     "--no-playlist",
-    // ASCII-only names — TikTok handles carry emoji and RTL text, which would
-    // otherwise land raw in the Content-Disposition header.
+    // ASCII-only names — handles on both sites carry emoji and RTL text, which
+    // would otherwise land raw in the Content-Disposition header.
     "--restrict-filenames",
     "--force-overwrites",
     "--ffmpeg-location", path.join(os.homedir(), "bin"),
   ];
-  execFile(YTDLP, args, { timeout: 180000 }, async (err) => {
+  execFile(YTDLP, args, { timeout: 180000 }, async (err, stdout, stderr) => {
     videoJobs--;
     if (err) {
       cleanup();
-      return res.status(502).json({
-        error: "TikTok download failed — the video may be private, removed, or region-locked.",
-      });
+      return ytdlpError(res, stderr, site);
     }
     try {
       const files = (await fsp.readdir(job)).filter((f) => !f.endsWith(".part"));
@@ -313,6 +352,22 @@ app.get("/api/tiktok", rateLimit(15), async (req, res) => {
       res.status(500).json({ error: "read failed" });
     }
   });
+}
+
+app.get("/api/tiktok", rateLimit(15), (req, res) => {
+  const url = siteUrl(req.query.url, /(^|\.)tiktok\.com$/i);
+  if (!url) return res.status(400).json({ error: "Not a valid TikTok link" });
+  ytdlpToClient(res, url, "TikTok");
+});
+
+app.get("/api/instagram", rateLimit(15), (req, res) => {
+  const url = siteUrl(req.query.url, /(^|\.)instagram\.com$/i);
+  if (!url) return res.status(400).json({ error: "Not a valid Instagram link" });
+  // direct=1 → JSON {url} with the CDN link (the app's fast path, ~1s);
+  // without it, stream the bytes as a normal download for the web UI and as
+  // the app's fallback when a direct link won't play.
+  if (req.query.direct === "1") return ytdlpDirectUrl(res, url, "Instagram");
+  ytdlpToClient(res, url, "Instagram");
 });
 
 // YouTube → MP3 via yt-dlp (Railway API primary, local fallback).

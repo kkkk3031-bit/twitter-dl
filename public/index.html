@@ -38,9 +38,9 @@
 <body>
 <div class="wrap">
   <h1><span>Tweet</span> Downloader</h1>
-  <p class="sub">Paste an X/Twitter link → get the <b>full text, images, video, and all info</b>. Or paste a <b>TikTok</b> link to download the video. <span class="rtl">حمّل نص وصور وفيديو التغريدة، أو فيديو تيك توك</span></p>
+  <p class="sub">Paste an X/Twitter link → get the <b>full text, images, video, and all info</b>. Or paste a <b>TikTok</b> or <b>Instagram</b> link to download the video. <span class="rtl">حمّل نص وصور وفيديو التغريدة، أو فيديو تيك توك وإنستغرام</span></p>
   <div class="row">
-    <input id="url" type="text" placeholder="https://x.com/user/status/123…  or  https://www.tiktok.com/@user/video/…" />
+    <input id="url" type="text" placeholder="https://x.com/user/status/123…  ·  tiktok.com/@user/video/…  ·  instagram.com/reel/…" />
     <button class="go" id="go">Get</button>
   </div>
   <div class="err" id="err"></div>
@@ -58,8 +58,14 @@
 const $ = (id) => document.getElementById(id);
 let current = null;
 
-function isTikTok(u) {
-  try { return /(^|\.)tiktok\.com$/i.test(new URL(u).hostname); } catch { return false; }
+// Sites we hand straight to a video endpoint — there is no tweet text or image
+// set to fetch first. Returns the endpoint + label, or null for an X link.
+function videoSite(u) {
+  let h;
+  try { h = new URL(u).hostname; } catch { return null; }
+  if (/(^|\.)tiktok\.com$/i.test(h)) return { api: "/api/tiktok", label: "TikTok" };
+  if (/(^|\.)instagram\.com$/i.test(h)) return { api: "/api/instagram", label: "Instagram" };
+  return null;
 }
 
 async function go() {
@@ -67,9 +73,9 @@ async function go() {
   if (!url) return;
   $("go").disabled = true; $("go").textContent = "…";
   $("err").style.display = "none"; $("card").style.display = "none";
-  // TikTok has no text/images to fetch — go straight to the video download.
-  if (isTikTok(url)) {
-    renderTikTok(url);
+  const site = videoSite(url);
+  if (site) {
+    renderVideoSite(url, site);
     $("go").disabled = false; $("go").textContent = "Get";
     return;
   }
@@ -103,13 +109,13 @@ function markdown(d) {
   return m;
 }
 
-function renderTikTok(url) {
+function renderVideoSite(url, site) {
   $("who").innerHTML = "";
-  $("text").textContent = "TikTok video";
+  $("text").textContent = site.label + " video";
   $("meta").innerHTML = "";
   $("imgs").innerHTML = "";
-  $("btns").innerHTML = `<a href="/api/tiktok?url=${encodeURIComponent(url)}">Download video</a>`;
-  $("note").innerHTML = `The MP4 is fetched server-side, so it can take a few seconds to start. Private, removed, or region-locked videos can't be downloaded. <span class="rtl">قد يستغرق التحميل بضع ثوانٍ</span>`;
+  $("btns").innerHTML = `<a href="${site.api}?url=${encodeURIComponent(url)}">Download video</a>`;
+  $("note").innerHTML = `The MP4 is fetched server-side, so it can take a few seconds to start. Private, removed, or region-locked videos can't be downloaded, and photo-only posts have nothing to save. <span class="rtl">قد يستغرق التحميل بضع ثوانٍ</span>`;
   $("card").style.display = "block";
 }
 

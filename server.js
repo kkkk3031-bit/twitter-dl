@@ -255,6 +255,66 @@ app.get("/api/video", rateLimit(15), async (req, res) => {
   });
 });
 
+// TikTok → MP4 via yt-dlp. Unlike X, the public page carries the media URL, so
+// this needs no cookies. Short share links (vm./vt.) redirect to the canonical
+// /video/<id> URL and yt-dlp follows them itself, so they pass through as-is.
+function tiktokUrl(input) {
+  const s = String(input || "").trim();
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  if (!/^https?:$/.test(u.protocol)) return null;
+  if (!/(^|\.)tiktok\.com$/i.test(u.hostname)) return null;
+  return u.toString();
+}
+
+app.get("/api/tiktok", rateLimit(15), async (req, res) => {
+  const url = tiktokUrl(req.query.url);
+  if (!url) return res.status(400).json({ error: "Not a valid TikTok link" });
+  if (videoJobs >= 2)
+    return res.status(429).json({ error: "Busy with other downloads — try again shortly." });
+  videoJobs++;
+  // Per-job dir: the filename comes from yt-dlp metadata, so there is no
+  // predictable name to collide on or to clean up by prefix.
+  const job = path.join(DL, `tt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  fs.mkdirSync(job, { recursive: true });
+  const cleanup = () => fs.rm(job, { recursive: true, force: true }, () => {});
+  const args = [
+    url,
+    "-o", path.join(job, "%(uploader)s-%(id)s.%(ext)s"),
+    "-f", "mp4/best",
+    "--no-playlist",
+    // ASCII-only names — TikTok handles carry emoji and RTL text, which would
+    // otherwise land raw in the Content-Disposition header.
+    "--restrict-filenames",
+    "--force-overwrites",
+    "--ffmpeg-location", path.join(os.homedir(), "bin"),
+  ];
+  execFile(YTDLP, args, { timeout: 180000 }, async (err) => {
+    videoJobs--;
+    if (err) {
+      cleanup();
+      return res.status(502).json({
+        error: "TikTok download failed — the video may be private, removed, or region-locked.",
+      });
+    }
+    try {
+      const files = (await fsp.readdir(job)).filter((f) => !f.endsWith(".part"));
+      if (!files.length) {
+        cleanup();
+        return res.status(404).json({ error: "no file produced" });
+      }
+      res.download(path.join(job, files[0]), files[0], cleanup);
+    } catch {
+      cleanup();
+      res.status(500).json({ error: "read failed" });
+    }
+  });
+});
+
 // YouTube → MP3 via yt-dlp (Railway API primary, local fallback).
 app.get("/api/mp3", rateLimit(5), async (req, res) => {
   const u = String(req.query.url || "");

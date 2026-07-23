@@ -38,9 +38,9 @@
 <body>
 <div class="wrap">
   <h1><span>Tweet</span> Downloader</h1>
-  <p class="sub">Paste an X/Twitter link → get the <b>full text, images, video, and all info</b>. <span class="rtl">حمّل نص وصور وفيديو التغريدة</span></p>
+  <p class="sub">Paste an X/Twitter link → get the <b>full text, images, video, and all info</b>. Or paste a <b>TikTok</b> link to download the video. <span class="rtl">حمّل نص وصور وفيديو التغريدة، أو فيديو تيك توك</span></p>
   <div class="row">
-    <input id="url" type="text" placeholder="https://x.com/user/status/123…  or  https://x.com/i/status/…" />
+    <input id="url" type="text" placeholder="https://x.com/user/status/123…  or  https://www.tiktok.com/@user/video/…" />
     <button class="go" id="go">Get</button>
   </div>
   <div class="err" id="err"></div>
@@ -58,11 +58,21 @@
 const $ = (id) => document.getElementById(id);
 let current = null;
 
+function isTikTok(u) {
+  try { return /(^|\.)tiktok\.com$/i.test(new URL(u).hostname); } catch { return false; }
+}
+
 async function go() {
   const url = $("url").value.trim();
   if (!url) return;
   $("go").disabled = true; $("go").textContent = "…";
   $("err").style.display = "none"; $("card").style.display = "none";
+  // TikTok has no text/images to fetch — go straight to the video download.
+  if (isTikTok(url)) {
+    renderTikTok(url);
+    $("go").disabled = false; $("go").textContent = "Get";
+    return;
+  }
   try {
     const r = await fetch("/api/fetch", { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify({ url }) });
     const d = await r.json();
@@ -91,6 +101,16 @@ function markdown(d) {
   if (d.images.length) m += `\n## Image URLs\n\n` + d.images.map(u=>`- ${u}?name=orig`).join("\n") + "\n";
   m += `\n## Comments\n\n_Not included — X needs login for full replies._\n`;
   return m;
+}
+
+function renderTikTok(url) {
+  $("who").innerHTML = "";
+  $("text").textContent = "TikTok video";
+  $("meta").innerHTML = "";
+  $("imgs").innerHTML = "";
+  $("btns").innerHTML = `<a href="/api/tiktok?url=${encodeURIComponent(url)}">Download video</a>`;
+  $("note").innerHTML = `The MP4 is fetched server-side, so it can take a few seconds to start. Private, removed, or region-locked videos can't be downloaded. <span class="rtl">قد يستغرق التحميل بضع ثوانٍ</span>`;
+  $("card").style.display = "block";
 }
 
 function render(d) {

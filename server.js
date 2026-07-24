@@ -370,6 +370,35 @@ app.get("/api/instagram", rateLimit(15), (req, res) => {
   ytdlpToClient(res, url, "Instagram");
 });
 
+// The app calls this on every start with the versionCode it is actually running.
+// The server does the comparison and logs the check-in, so "is that phone on the
+// latest build?" is answerable here instead of guessed. Falls back gracefully:
+// an app that only knows kdl-version.json still works, that file stays as is.
+app.get("/api/kdl-check", rateLimit(60), (req, res) => {
+  let latest = {};
+  try {
+    latest = JSON.parse(fs.readFileSync(path.join(__dirname, "public", "kdl-version.json"), "utf8"));
+  } catch (e) {
+    return res.status(500).json({ error: "no version file" });
+  }
+  const vc = parseInt(req.query.vc, 10) || 0;
+  const upToDate = vc >= (latest.versionCode || 0);
+  try {
+    fs.appendFileSync(path.join(process.env.HOME, ".cache", "kdl-checkins.log"),
+      `${new Date().toISOString()} vc=${vc} vn=${req.query.vn || "?"} latest=${latest.versionCode} ` +
+      `${upToDate ? "uptodate" : "OUTDATED"} ip=${req.ip}\n`);
+  } catch (e) { /* logging must never break the check */ }
+  res.json({
+    ok: true,
+    versionCode: latest.versionCode,
+    versionName: latest.versionName,
+    url: latest.url,
+    date: latest.date,
+    yours: vc,
+    upToDate,
+  });
+});
+
 // YouTube → MP3 via yt-dlp (Railway API primary, local fallback).
 app.get("/api/mp3", rateLimit(5), async (req, res) => {
   const u = String(req.query.url || "");

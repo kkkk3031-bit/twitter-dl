@@ -28,6 +28,13 @@
   .imgs { display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:8px; margin:12px 0; }
   .imgs img { width:100%; border-radius:8px; border:1px solid var(--line); }
   .btns { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+  .comments { display:none; margin-top:16px; border-top:1px solid var(--line); padding-top:12px; max-height:420px; overflow-y:auto; }
+  .comments .chead { font-size:12px; color:var(--amber); font-weight:700; margin-bottom:10px; }
+  .comments .c { border-left:2px solid var(--line); padding:0 0 0 10px; margin:0 0 12px; }
+  .comments .ch { font-size:13px; font-weight:700; display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+  .comments .cd { font-weight:400; font-size:11px; opacity:.55; }
+  .comments .ct { font-size:14px; margin:3px 0; white-space:pre-wrap; word-break:break-word; }
+  .comments .cs { font-size:11px; opacity:.6; }
   .btns button, .btns a { background:#1E2129; color:var(--txt); border:1px solid var(--line); border-radius:9px; padding:9px 13px; font-size:13px; font-weight:600; text-decoration:none; display:inline-block; }
   .btns button:hover, .btns a:hover { border-color:var(--amber); color:var(--amber); }
   .note { color:var(--dim); font-size:12.5px; margin-top:14px; border-top:1px solid var(--line); padding-top:12px; }
@@ -51,6 +58,7 @@
     <div class="meta" id="meta"></div>
     <div class="imgs" id="imgs"></div>
     <div class="btns" id="btns"></div>
+    <div id="comments" class="comments"></div>
     <div class="note" id="note"></div>
   </div>
 </div>
@@ -83,6 +91,8 @@ async function go() {
     return;
   }
   try {
+    comments = null; commentsVia = "";
+    const cb = $("comments"); if (cb) { cb.style.display = "none"; cb.innerHTML = ""; }
     const r = await fetch("/api/fetch", { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify({ url }) });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || "failed");
@@ -93,6 +103,37 @@ async function go() {
   } finally {
     $("go").disabled = false; $("go").textContent = "Get";
   }
+}
+
+let comments = null, commentsVia = "";
+
+// Replies come from a public mirror the server drives with a headless browser,
+// so the first call pays that mirror's bot-check (~15s) and later ones are cached.
+async function loadComments(id, btn) {
+  btn.disabled = true; btn.textContent = "Loading replies… (~15s)";
+  try {
+    const r = await fetch(`/api/comments?url=${encodeURIComponent("https://x.com/i/status/"+id)}`);
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || "failed");
+    comments = d.replies; commentsVia = d.via;
+    btn.textContent = `Replies ✓ ${d.count}${d.partial?"+":""}`;
+    renderComments(d);
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = "Load comments";
+    $("note").innerHTML = `Couldn't load replies: ${esc(e.message)}`;
+  }
+}
+
+function renderComments(d) {
+  const box = $("comments");
+  box.innerHTML = `<div class="chead">${d.count} replies${d.partial?" (first pages)":""} · via ${esc(d.via)} · no login</div>` +
+    d.replies.map(r => `<div class="c"><div class="ch">@${esc(r.handle)}` +
+      `<span class="cd">${esc(r.date||"")}</span></div>` +
+      `<div class="ct">${esc(r.text||"")}</div>` +
+      `<div class="cs">❤ ${r.likes??0}${r.retweets?` · 🔁 ${r.retweets}`:""}${r.replies?` · 💬 ${r.replies}`:""}` +
+      `${r.images&&r.images.length?` · 🖼 ${r.images.length}`:""}</div></div>`).join("");
+  box.style.display = "block";
 }
 
 function download(name, text, type="text/plain") {
@@ -108,7 +149,17 @@ function markdown(d) {
   m += `- Likes: ${d.stats?.likes??"?"} · Thread: ${d.stats?.retweets??"?"}\n`;
   m += `- Images: ${d.images.length} · Video: ${d.has_video?"yes":"no"}\n\n## Text\n\n${d.text||"(none)"}\n`;
   if (d.images.length) m += `\n## Image URLs\n\n` + d.images.map(u=>`- ${u}?name=orig`).join("\n") + "\n";
-  m += `\n## Comments\n\n_Not included — X needs login for full replies._\n`;
+  m += `\n## Comments / replies\n\n`;
+  if (comments && comments.length) {
+    m += `_${comments.length} replies via ${commentsVia||"public mirror"}, no login_\n\n`;
+    m += comments.map(r =>
+      `- **@${r.handle}**${r.date?` · ${r.date}`:""}` +
+      `${r.replying_to&&r.replying_to.length?` ↩ ${r.replying_to.join(" ")}`:""}` +
+      ` (❤${r.likes??0}${r.retweets?` 🔁${r.retweets}`:""}${r.replies?` 💬${r.replies}`:""}): ` +
+      `${(r.text||"").replace(/\n/g," ")}`).join("\n") + "\n";
+  } else {
+    m += `_Press "Load comments" first to include the reply thread._\n`;
+  }
   return m;
 }
 
@@ -135,10 +186,11 @@ function render(d) {
   b.push(`<button onclick="download('tweet-${d.id}.txt', current.text||'')">Text .txt</button>`);
   b.push(`<button onclick="download('tweet-${d.id}.md', markdown(current))">AI markdown</button>`);
   b.push(`<button onclick="download('tweet-${d.id}.json', JSON.stringify(current.raw,null,2),'application/json')">All info .json</button>`);
+  b.push(`<button onclick="loadComments('${d.id}', this)">Load comments</button>`);
   d.images.forEach((u,i)=> b.push(`<a href="/api/image?u=${encodeURIComponent(u)}">Image ${i+1}</a>`));
   if (d.has_video) b.push(`<a href="/api/video?url=${encodeURIComponent('https://x.com/i/status/'+d.id)}">Download video</a>`);
   $("btns").innerHTML = b.join("");
-  $("note").innerHTML = `Comments/replies aren't downloadable without an X login — this pulls everything the public embed exposes. <b>AI markdown</b> gives a clean file for Claude.`;
+  $("note").innerHTML = `<b>Load comments</b> pulls the full reply thread — no X login, no cookies (first load ~15s, then instant). <b>AI markdown</b> gives a clean file for Claude, replies included. <span class="rtl">التعليقات بدون تسجيل دخول</span>`;
   $("card").style.display = "block";
 }
 function esc(s){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }

@@ -1,0 +1,331 @@
+#!/usr/bin/env node
+// twdl <tweet-url|id> [--json] [--save]
+// Fetches a tweet via X's public syndication endpoint and prints it in an
+// AI-agent-readable form (clean markdown by default, raw JSON with --json).
+// --save writes a markdown note into the Obsidian vault (~/vault/Wiki).
+const os = require("os");
+const fs = require("fs");
+const path = require("path");
+const { execSync } = require("child_process");
+
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36";
+
+function tweetId(s) {
+  s = String(s || "").trim();
+  if (/^\d{5,25}$/.test(s)) return s;
+  const m = s.match(/(?:twitter|x)\.com\/[^/]+\/status(?:es)?\/(\d+)/i);
+  return m ? m[1] : null;
+}
+// ---- Comments (needs a browser cookie from a logged-in account) ----
+// Reads a Netscape cookies.txt at ~/.config/twdl/cookies.txt and pulls the
+// reply thread via X's web GraphQL TweetDetail endpoint. Brittle by nature:
+// X rotates the query id and reply shape often. Best-effort, honest on failure.
+const COOKIE_PATH = path.join(os.homedir(), ".config", "twdl", "cookies.txt");
+// Public X web app bearer (guest token used by twitter.com itself).
+const WEB_BEARER =
+  "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
+// Rotates periodically — override with env TWDL_TWEETDETAIL_QID when it breaks.
+const TWEETDETAIL_QID = process.env.TWDL_TWEETDETAIL_QID || "xOhkmRac04YFZmOzU9PJHg";
+
+function readCookies() {
+  if (!fs.existsSync(COOKIE_PATH)) return null;
+  const out = {};
+  for (const line of fs.readFileSync(COOKIE_PATH, "utf8").split("\n")) {
+    if (!line || line.startsWith("#")) continue;
+    const p = line.split("\t");
+    if (p.length >= 7) out[p[5]] = p[6].trim();
+  }
+  if (!out.auth_token || !out.ct0) return null;
+  return out;
+}
+
+// No cookie, no problem: a public Nitter mirror still renders the whole
+// conversation, and the headless Chromium in ~/twitter-dl walks through the
+// mirrors' bot walls. Cookies, when present, still win — they come straight
+// from X and carry the exact ordering X itself shows.
+async function fetchCommentsNoLogin(id, handle) {
+  try {
+    const { fetchCommentsNoLogin: go } = require("/home/khaled/twitter-dl/comments.js");
+    const r = await go(id, handle);
+    if (r.ok) return { ok: true, replies: r.replies, via: r.via, partial: r.partial };
+    return { ok: false, reason: r.reason };
+  } catch (e) {
+    return { ok: false, reason: `no-login path failed: ${e.message}` };
+  }
+}
+
+async function fetchComments(id, handle) {
+  const c = readCookies();
+  if (!c) return fetchCommentsNoLogin(id, handle);
+  const cookieHeader = Object.entries(c)
+    .map(([k, v]) => `${k}=${v}`)
+    .join("; ");
+  const variables = {
+    focalTweetId: id,
+    with_rux_injections: false,
+    includePromotedContent: false,
+    withCommunity: true,
+    withQuickPromoteEligibilityTweetFields: false,
+    withBirdwatchNotes: false,
+    withVoice: false,
+    withV2Timeline: true,
+  };
+  const features = {
+    responsive_web_graphql_exclude_directive_enabled: true,
+    verified_phone_label_enabled: false,
+    responsive_web_graphql_timeline_navigation_enabled: true,
+    creator_subscriptions_tweet_preview_api_enabled: true,
+    tweetypie_unmention_optimization_enabled: true,
+    responsive_web_edit_tweet_api_enabled: true,
+    view_counts_everywhere_api_enabled: true,
+    longform_notetweets_consumption_enabled: true,
+    tweet_awards_web_tipping_enabled: false,
+    freedom_of_speech_not_reach_fetch_enabled: true,
+    standardized_nudges_misinfo: true,
+    longform_notetweets_rich_text_read_enabled: true,
+    responsive_web_enhance_cards_enabled: false,
+    responsive_web_twitter_article_tweet_consumption_enabled: false,
+    tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
+    longform_notetweets_inline_media_enabled: true,
+    graphql_is_translatable_rweb_tweet_is_translatable_enabled: true,
+    tweet_with_visibility_results_prefer_gql_media_interstitial_enabled: false,
+    responsive_web_media_download_video_enabled: false,
+    interactive_text_enabled: false,
+    responsive_web_text_conversations_enabled: false,
+  };
+  const url =
+    `https://x.com/i/api/graphql/${TWEETDETAIL_QID}/TweetDetail` +
+    `?variables=${encodeURIComponent(JSON.stringify(variables))}` +
+    `&features=${encodeURIComponent(JSON.stringify(features))}`;
+  const r = await fetch(url, {
+    headers: {
+      authorization: `Bearer ${WEB_BEARER}`,
+      "x-csrf-token": c.ct0,
+      cookie: cookieHeader,
+      "User-Agent": UA,
+      "x-twitter-active-user": "yes",
+      "x-twitter-auth-type": "OAuth2Session",
+    },
+  });
+  if (!r.ok) return { ok: false, reason: `TweetDetail HTTP ${r.status} (cookie may be expired or query id stale — set TWDL_TWEETDETAIL_QID)` };
+  const j = await r.json();
+  const replies = [];
+  try {
+    const instr =
+      j.data.threaded_conversation_with_injections_v2.instructions.find(
+        (i) => i.type === "TimelineAddEntries",
+      );
+    for (const e of instr.entries || []) {
+      const items =
+        e.content?.items ||
+        (e.content?.itemContent ? [{ item: { itemContent: e.content.itemContent } }] : []);
+      for (const it of items) {
+        const res =
+          it.item?.itemContent?.tweet_results?.result ||
+          it.item?.content?.tweet_results?.result;
+        const legacy = res?.legacy || res?.tweet?.legacy;
+        const user =
+          res?.core?.user_results?.result?.legacy ||
+          res?.tweet?.core?.user_results?.result?.legacy;
+        if (legacy && legacy.id_str !== id)
+          replies.push({
+            handle: user?.screen_name || "?",
+            text: legacy.full_text || legacy.text || "",
+            likes: legacy.favorite_count ?? null,
+          });
+      }
+    }
+  } catch (err) {
+    return { ok: false, reason: `parse failed (${err.message}) — X likely changed the reply shape` };
+  }
+  return { ok: true, replies };
+}
+
+function token(id) {
+  return ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, "");
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const json = args.includes("--json");
+  const save = args.includes("--save");
+  // Replies now work with no login at all (see fetchComments), so "all the info"
+  // is the default; --fast skips the browser hop when only text/media is wanted.
+  const fast = args.includes("--fast") || args.includes("--no-comments");
+  const comments = !fast && !json;
+  const html = args.includes("--html");
+  const url = args.find((a) => !a.startsWith("--"));
+  const id = tweetId(url);
+  if (!id) {
+    console.error(
+      "usage: twdl <tweet-url|id> [--fast] [--html] [--json] [--save]\n" +
+        "  replies are included by default (no login needed) — --fast skips them",
+    );
+    process.exit(2);
+  }
+  const api = `https://cdn.syndication.twimg.com/tweet-result?id=${id}&token=${token(id)}&lang=en`;
+  const r = await fetch(api, { headers: { "User-Agent": UA, Accept: "application/json" } });
+  if (!r.ok) {
+    console.error(`Failed: HTTP ${r.status} (tweet may be private/deleted)`);
+    process.exit(1);
+  }
+  let t = await r.json();
+  // Sensitive-flagged tweets tombstone on the syndication endpoint; fxtwitter
+  // still serves them (incl. direct mp4 URLs). Map its shape onto the one the
+  // rest of this script expects.
+  if (t?.__typename === "TweetTombstone" || (!t.user && !t.text)) {
+    try {
+      const fr = await fetch(`https://api.fxtwitter.com/status/${id}`, {
+        headers: { "User-Agent": UA, Accept: "application/json" },
+      });
+      const fx = (await fr.json()).tweet;
+      if (fx) {
+        const media = fx.media?.all || [];
+        t = {
+          id_str: fx.id,
+          text: fx.text,
+          created_at: fx.created_at,
+          favorite_count: fx.likes,
+          conversation_count: fx.replies,
+          user: fx.author
+            ? { screen_name: fx.author.screen_name, name: fx.author.name }
+            : null,
+          mediaDetails: media.map((m) => ({
+            type: m.type === "gif" ? "animated_gif" : m.type,
+            media_url_https: m.type === "photo" ? m.url : m.thumbnail_url,
+            video_url: m.type !== "photo" ? m.url : undefined,
+          })),
+          quoted_tweet: fx.quote
+            ? { text: fx.quote.text, user: { screen_name: fx.quote.author?.screen_name } }
+            : undefined,
+          __via_fxtwitter: true,
+        };
+      }
+    } catch {}
+  }
+  if (json) {
+    console.log(JSON.stringify(t, null, 2));
+    return;
+  }
+  const photos = [
+    ...new Set(
+      (t.mediaDetails || [])
+        .filter((m) => m.type === "photo")
+        .map((m) => m.media_url_https || m.url)
+        .filter(Boolean),
+    ),
+  ];
+  const hasVideo = (t.mediaDetails || []).some(
+    (m) => m.type === "video" || m.type === "animated_gif",
+  );
+  const u = t.user || {};
+  const md = [
+    `# Tweet by @${u.screen_name || "?"} (${u.name || ""})`,
+    ``,
+    `- URL: https://x.com/i/status/${id}`,
+    `- Posted: ${t.created_at || "?"}`,
+    `- Likes: ${t.favorite_count ?? "?"} · Replies/thread: ${t.conversation_count ?? "?"}`,
+    `- Images: ${photos.length} · Video: ${hasVideo ? "yes" : "no"}`,
+    ``,
+    `## Text`,
+    ``,
+    (t.text || t.full_text || "").trim() || "(no text)",
+  ];
+  if (t.quoted_tweet) {
+    md.push(
+      ``,
+      `## Quoted tweet (@${t.quoted_tweet.user?.screen_name || "?"})`,
+      ``,
+      (t.quoted_tweet.text || "").trim(),
+    );
+  }
+  if (photos.length) {
+    md.push(``, `## Image URLs`, ``, ...photos.map((p) => `- ${p}?name=orig`));
+  }
+  md.push(``, `## Comments / replies`, ``);
+  if (comments) {
+    const c = await fetchComments(id, u.screen_name);
+    if (c.ok && c.replies.length) {
+      md.push(
+        `_${c.replies.length} replies${c.partial ? " (first pages)" : ""}` +
+          `${c.via ? ` · via ${c.via}, no login` : " · via X login cookie"}_`,
+        ``,
+      );
+      c.replies.forEach((r) => {
+        const to = r.replying_to?.length ? ` ↩ ${r.replying_to.join(" ")}` : "";
+        const st = [
+          r.likes != null ? `❤${r.likes}` : null,
+          r.retweets ? `🔁${r.retweets}` : null,
+          r.replies ? `💬${r.replies}` : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+        md.push(
+          `- **@${r.handle}**${r.date ? ` · ${r.date}` : ""}${to} (${st}): ` +
+            `${(r.text || "").replace(/\n/g, " ")}` +
+            `${r.images?.length ? ` [img: ${r.images.length}]` : ""}`,
+        );
+      });
+    } else if (c.ok) md.push(`_No replies returned._`);
+    else md.push(`_Couldn't fetch replies: ${c.reason}_`);
+  } else {
+    md.push(`_Skipped (--fast). Drop the flag to pull the reply thread — no login needed._`);
+  }
+  const out = md.join("\n");
+  console.log(out);
+
+  if (html) {
+    let rep = [];
+    const c = await fetchComments(id, u.screen_name);
+    if (c.ok) rep = c.replies;
+    const esc = (s) =>
+      String(s || "").replace(/[&<>"]/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[m]));
+    const doc = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tweet @${esc(u.screen_name)} ${id}</title>
+<style>body{background:#0a0b0f;color:#e8eaed;font:15px/1.6 system-ui,Segoe UI,Roboto,sans-serif;max-width:640px;margin:0 auto;padding:24px}
+h1{font-size:19px}.a{color:#F59E0B}.dim{color:#9aa0ab;font-size:13px}
+.text{white-space:pre-wrap;font-size:17px;margin:12px 0}
+img{max-width:100%;border-radius:10px;border:1px solid #262a33;margin:6px 0}
+.rep{border-top:1px solid #262a33;padding:10px 0}.rep b{color:#F59E0B}
+.tag{display:inline-block;background:#14161c;border:1px solid #262a33;border-radius:6px;padding:2px 8px;margin-right:6px;font-size:12px}</style></head><body>
+<h1>Tweet by <span class="a">@${esc(u.screen_name)}</span> <span class="dim">(${esc(u.name)})</span></h1>
+<div class="dim"><span class="tag">❤ ${t.favorite_count ?? "?"}</span><span class="tag">💬 ${t.conversation_count ?? "?"}</span><span class="tag">${esc(t.created_at)}</span></div>
+<div class="text">${esc(t.text || t.full_text)}</div>
+${photos.map((p) => `<img src="${esc(p)}?name=orig" loading="lazy">`).join("")}
+<h2 style="font-size:15px" class="dim">Replies (${rep.length})</h2>
+${rep.length ? rep.map((r) => `<div class="rep"><b>@${esc(r.handle)}</b> <span class="dim">❤${r.likes ?? "?"}</span><div>${esc(r.text)}</div></div>`).join("") : `<div class="dim">${c.ok ? "No replies returned." : "Replies need a login cookie: " + esc(c.reason)}</div>`}
+<p class="dim" style="margin-top:24px">Grabbed by twdl · <a class="a" href="https://x.com/i/status/${id}">source</a></p>
+</body></html>`;
+    const outdir = fs.existsSync(path.join(os.homedir(), "twitter-dl"))
+      ? path.join(os.homedir(), "twitter-dl", "downloads")
+      : process.cwd();
+    const f = path.join(outdir, `tweet-${u.screen_name || "x"}-${id}.html`);
+    fs.writeFileSync(f, doc);
+    console.error(`\nHTML file → ${f}`);
+  }
+
+  if (save) {
+    const dir = path.join(os.homedir(), "vault", "Wiki");
+    if (fs.existsSync(path.dirname(dir))) {
+      fs.mkdirSync(dir, { recursive: true });
+      const f = path.join(dir, `Tweet-${u.screen_name || "x"}-${id}.md`);
+      fs.writeFileSync(f, out + "\n");
+      try {
+        execSync(`${path.join(os.homedir(), "bin", "vault-sync")} "save tweet ${id}"`, {
+          stdio: "ignore",
+        });
+      } catch {}
+      console.error(`\nsaved → ${f}`);
+    }
+  }
+}
+// The no-login reply path parks a headless browser for reuse, which keeps the
+// event loop alive — a CLI has nothing to reuse it for, so it leaves outright.
+main()
+  .then(() => process.exit(0))
+  .catch((e) => {
+    console.error("error:", e.message);
+    process.exit(1);
+  });

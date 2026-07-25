@@ -9,6 +9,7 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const { execFile } = require("child_process");
 const { convertViaWeb } = require("./converters");
+const { fetchCommentsNoLogin } = require("./comments");
 
 const app = express();
 app.use(express.json({ limit: "256kb" }));
@@ -101,7 +102,7 @@ function normalizeFx(t) {
     images: media.filter((m) => m.type === "photo").map((m) => m.url),
     has_video: media.some((m) => m.type === "video" || m.type === "gif"),
     quoted: t.quote ? { text: t.quote.text, handle: t.quote.author?.screen_name } : null,
-    comments_available: false,
+    comments_available: true,
     raw: t,
   };
 }
@@ -148,9 +149,9 @@ function normalize(t) {
     quoted: t.quoted_tweet
       ? { text: t.quoted_tweet.text, handle: t.quoted_tweet.user?.screen_name }
       : null,
-    // The public endpoint returns at most a couple of parent tweets, never the
-    // full reply thread — comments require a logged-in account.
-    comments_available: false,
+    // X's own endpoints never carry the reply thread logged-out, but a public
+    // Nitter mirror does — /api/comments walks one with a headless browser.
+    comments_available: true,
     raw: t,
   };
 }
@@ -168,6 +169,39 @@ app.post("/api/fetch", rateLimit(20), async (req, res) => {
     } catch {
       res.status(502).json({ error: `Couldn't read that tweet (${err.message}). It may be private or deleted.` });
     }
+  }
+});
+
+// Replies, with no X account anywhere in the loop. X serves none of these
+// logged-out (syndication has no reply field, fxtwitter only a count, guest
+// TweetDetail 404s), so this walks a public Nitter mirror in a headless browser
+// — the same trick /api/convert already uses for converter sites. Cold call
+// pays the mirror's proof-of-work wall (~15s); after that its cookie is cached.
+app.get("/api/comments", rateLimit(10), async (req, res) => {
+  const id = tweetId(req.query.url);
+  if (!id) return res.status(400).json({ error: "Not a valid tweet link or ID" });
+  let handle = String(req.query.handle || "").replace(/[^A-Za-z0-9_]/g, "");
+  try {
+    if (!handle) {
+      // Nitter needs the author in the path; the public endpoint hands it over.
+      const t = await fetchTweet(id).catch(() => null);
+      handle = t?.user?.screen_name || (await fetchFx(id).catch(() => null))?.author?.screen_name || "";
+    }
+    const r = await fetchCommentsNoLogin(id, handle, {
+      maxPages: Math.min(5, Math.max(1, Number(req.query.pages) || 3)),
+    });
+    if (!r.ok) return res.status(502).json({ error: r.reason });
+    res.json({
+      ok: true,
+      id,
+      via: r.via,
+      login_required: false,
+      partial: !!r.partial,
+      count: r.replies.length,
+      replies: r.replies,
+    });
+  } catch (e) {
+    res.status(502).json({ error: `comments failed: ${e.message}` });
   }
 });
 

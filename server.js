@@ -8,6 +8,7 @@ const os = require("os");
 const fs = require("fs");
 const fsp = require("fs/promises");
 const { execFile } = require("child_process");
+const { convertViaWeb } = require("./converters");
 
 const app = express();
 app.use(express.json({ limit: "256kb" }));
@@ -299,13 +300,15 @@ function ytdlpError(res, stderr, site) {
 // pull the file first. Only offered for Instagram: its signed links serve from
 // any IP with no headers, while TikTok's CDN 403s anything but the session that
 // extracted them (verified both ways), which is why /api/tiktok streams instead.
-function ytdlpDirectUrl(res, url, site) {
+function ytdlpDirectUrl(res, url, site, onNoVideo) {
   if (videoJobs >= 2)
     return res.status(429).json({ error: "Busy with other downloads — try again shortly." });
   videoJobs++;
   const args = [url, "-g", "-f", "mp4/best", "--no-playlist", "--no-warnings"];
   execFile(YTDLP, args, { timeout: 60000 }, (err, stdout, stderr) => {
     videoJobs--;
+    if (err && onNoVideo && /no video in this post|there is no video/i.test(String(stderr)))
+      return onNoVideo();
     if (err) return ytdlpError(res, stderr, site);
     const direct = String(stdout || "").trim().split("\n")[0];
     if (!/^https:\/\//.test(direct))
@@ -314,7 +317,7 @@ function ytdlpDirectUrl(res, url, site) {
   });
 }
 
-function ytdlpToClient(res, url, site) {
+function ytdlpToClient(res, url, site, onNoVideo) {
   if (videoJobs >= 2)
     return res.status(429).json({ error: "Busy with other downloads — try again shortly." });
   videoJobs++;
@@ -338,6 +341,8 @@ function ytdlpToClient(res, url, site) {
     videoJobs--;
     if (err) {
       cleanup();
+      if (onNoVideo && /no video in this post|there is no video/i.test(String(stderr)))
+        return onNoVideo();
       return ytdlpError(res, stderr, site);
     }
     try {
@@ -354,6 +359,126 @@ function ytdlpToClient(res, url, site) {
   });
 }
 
+// ── multi-site converter ───────────────────────────────────────────────────
+// Everything yt-dlp can pull that is not one of the four first-class sites.
+// The host list is an allowlist on purpose: this endpoint hands a user-supplied
+// URL to a subprocess, so "any URL" would be an SSRF hole aimed at the VPS's own
+// network. Adding a site is one entry here — nothing else changes.
+const MEDIA_HOSTS =
+  /^(?:.*\.)?(facebook\.com|fb\.watch|fb\.com|reddit\.com|redd\.it|pinterest\.[a-z.]{2,6}|pin\.it|snapchat\.com|twitch\.tv|vimeo\.com|dailymotion\.com|dai\.ly|kick\.com|tumblr\.com|threads\.net|threads\.com|streamable\.com|imgur\.com|rumble\.com|odysee\.com|bilibili\.com|ok\.ru|vk\.com|soundcloud\.com|9gag\.com|likee\.video|linkedin\.com|bsky\.app|twitch\.com)$/i;
+
+const SITE_LIST = [
+  "Facebook", "Reddit", "Pinterest", "Snapchat", "Twitch", "Vimeo", "Dailymotion",
+  "Kick", "Tumblr", "Threads", "Streamable", "Imgur", "Rumble", "Odysee",
+  "Bilibili", "OK.ru", "VK", "SoundCloud", "9GAG", "Likee", "LinkedIn", "Bluesky",
+];
+
+function siteLabel(u) {
+  try {
+    const h = new URL(u).hostname.replace(/^www\./, "").split(".")[0];
+    return h.charAt(0).toUpperCase() + h.slice(1);
+  } catch {
+    return "Media";
+  }
+}
+
+// Same trick the app already uses for YouTube and Instagram: ask for the signed
+// direct link first (~1s, the phone then pulls the bytes straight from the
+// source CDN and this box carries none of it), and only stream through the VPS
+// when a site's CDN refuses outsiders — TikTok-style. One endpoint, both paths.
+app.get("/api/media", rateLimit(15), (req, res) => {
+  const url = siteUrl(req.query.url, MEDIA_HOSTS);
+  if (!url)
+    return res.status(400).json({
+      error: "That site isn't supported yet.",
+      supported: SITE_LIST,
+    });
+  const site = siteLabel(url);
+  if (req.query.direct === "1") return ytdlpDirectUrl(res, url, site);
+  ytdlpToClient(res, url, site);
+});
+
+// So the app and the web UI can show the real list instead of hard-coding it.
+app.get("/api/sites", rateLimit(60), (_req, res) =>
+  res.json({ ok: true, first_class: ["X / Twitter", "YouTube", "TikTok", "Instagram"], more: SITE_LIST })
+);
+
+// The catch-all: any link from anywhere. Three tiers, cheapest first —
+//   1. yt-dlp direct link  (~1s, phone pulls from the source CDN, no VPS bytes)
+//   2. online converter driven by a headless browser (covers what yt-dlp can't:
+//      Reddit's login wall, Vimeo's OAuth, small sites with no extractor)
+//   3. yt-dlp streaming through this box (last resort, costs bandwidth)
+// direct=1 answers with JSON for the app; a plain call redirects to the link so
+// a browser just downloads it.
+app.get("/api/convert", rateLimit(10), (req, res) => {
+  const url = siteUrl(req.query.url, /.*/);
+  if (!url) return res.status(400).json({ error: "Not a valid link" });
+  let host;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return res.status(400).json({ error: "Not a valid link" });
+  }
+  // Never let a pasted link point this server at its own network. The literal
+  // check is not enough on its own — a public hostname can resolve to a private
+  // address — so the resolved IPs are checked too, below.
+  if (/^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.|169\.254\.|\[?::1)/i.test(host))
+    return res.status(400).json({ error: "Not a valid link" });
+
+  const site = siteLabel(url);
+  const wantJson = req.query.direct === "1";
+
+  // A public hostname is allowed to resolve wherever it likes — including this
+  // box's own network — so the addresses are checked, not just the text.
+  const privateIp = (ip) =>
+    /^(10\.|127\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$|f[cd])/i.test(ip);
+
+  const tryBrowser = async () => {
+    const r = await convertViaWeb(url);
+    if (r && r.url) {
+      // The app gets the link plus the headers that make it work, and pulls the
+      // bytes itself. A browser cannot attach someone else's cookies to a plain
+      // download, so for the web UI this box streams it through instead.
+      if (wantJson)
+        return res.json({ ok: true, url: r.url, via: r.via, site, headers: r.headers || {} });
+      try {
+        const up = await fetch(r.url, { headers: r.headers || {}, signal: AbortSignal.timeout(180000) });
+        if (!up.ok) throw new Error(String(up.status));
+        res.setHeader("Content-Type", "video/mp4");
+        res.setHeader("Content-Disposition", `attachment; filename="${site.toLowerCase()}-video.mp4"`);
+        const len = up.headers.get("content-length");
+        if (len) res.setHeader("Content-Length", len);
+        const { Readable } = require("stream");
+        return Readable.fromWeb(up.body).pipe(res);
+      } catch {
+        return ytdlpToClient(res, url, site);
+      }
+    }
+    // Tier 3: nothing direct worked — carry the bytes ourselves.
+    if (wantJson)
+      return res.status(502).json({ error: `${site}: no direct link found — try the in-app download.` });
+    return ytdlpToClient(res, url, site);
+  };
+
+  require("dns").promises
+    .lookup(host, { all: true })
+    .then((addrs) => {
+      if (addrs.some((a) => privateIp(a.address))) throw new Error("private");
+      const args = [url, "-g", "-f", "mp4/best", "--no-playlist", "--no-warnings"];
+      execFile(YTDLP, args, { timeout: 45000 }, (err, stdout) => {
+        const direct = String(stdout || "").trim().split("\n")[0];
+        if (!err && /^https:\/\//.test(direct)) {
+          if (wantJson) return res.json({ ok: true, url: direct, via: "yt-dlp", site });
+          return res.redirect(302, direct);
+        }
+        tryBrowser().catch(() =>
+          res.status(502).json({ error: `${site}: conversion failed` })
+        );
+      });
+    })
+    .catch(() => res.status(400).json({ error: "Not a valid link" }));
+});
+
 app.get("/api/tiktok", rateLimit(15), (req, res) => {
   const url = siteUrl(req.query.url, /(^|\.)tiktok\.com$/i);
   if (!url) return res.status(400).json({ error: "Not a valid TikTok link" });
@@ -363,12 +488,76 @@ app.get("/api/tiktok", rateLimit(15), (req, res) => {
 app.get("/api/instagram", rateLimit(15), (req, res) => {
   const url = siteUrl(req.query.url, /(^|\.)instagram\.com$/i);
   if (!url) return res.status(400).json({ error: "Not a valid Instagram link" });
+  // A photo post has no video by definition, so yt-dlp saying "there is no
+  // video" is the correct answer, not a failure — fall through to the image
+  // path instead of reporting an error the way it used to.
+  const photos = () => igPhotos(req, res, url);
   // direct=1 → JSON {url} with the CDN link (the app's fast path, ~1s);
   // without it, stream the bytes as a normal download for the web UI and as
   // the app's fallback when a direct link won't play.
-  if (req.query.direct === "1") return ytdlpDirectUrl(res, url, "Instagram");
-  ytdlpToClient(res, url, "Instagram");
+  if (req.query.direct === "1") return ytdlpDirectUrl(res, url, "Instagram", photos);
+  ytdlpToClient(res, url, "Instagram", photos);
 });
+
+// Instagram photos. The public embed page carries the full-size image and needs
+// no login, which is the only reason photo posts can work at all here — the
+// regular endpoints are login-walled. Same shape as the video path: direct=1
+// hands back the CDN links, otherwise the image is streamed as a download.
+const IG_CODE = /\/(?:reels?|p|tv)\/([\w-]+)/;
+
+async function igImageUrls(url) {
+  const m = IG_CODE.exec(new URL(url).pathname);
+  if (!m) return [];
+  // The bare UA matters: a full Chrome UA gets the 600KB JS app shell with no
+  // image in it, while a minimal one gets the ~100KB server-rendered embed that
+  // still carries the picture. Verified both ways — do not "modernise" this.
+  const r = await fetch(`https://www.instagram.com/p/${m[1]}/embed/captioned/`, {
+    headers: { "User-Agent": "Mozilla/5.0" },
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!r.ok) return [];
+  const html = await r.text();
+  const out = [];
+  for (const mm of html.matchAll(/"display_url":"([^"]+)"/g)) {
+    try {
+      out.push(JSON.parse(`"${mm[1]}"`));
+    } catch {}
+  }
+  if (!out.length) {
+    // The server-rendered embed inlines the <img> instead of a JSON blob.
+    // t51.2885-19 and the s100x100/s150x150 crops are the poster's avatar, not
+    // the post itself — dropping them is what separates photo from profile pic.
+    for (const mm of html.matchAll(/src="(https:\/\/[^"]*scontent[^"]*t51[^"]*)"/g)) {
+      const u = mm[1].replace(/&amp;/g, "&");
+      if (!/t51\.2885-19|s150x150|s100x100|profile_pic/.test(u)) out.push(u);
+    }
+  }
+  return [...new Set(out)];
+}
+
+async function igPhotos(req, res, url) {
+  let imgs = [];
+  try {
+    imgs = await igImageUrls(url);
+  } catch {}
+  if (!imgs.length)
+    return res.status(404).json({
+      error: "This Instagram post has no video, and its photo could not be read — it may be private.",
+    });
+  const code = (IG_CODE.exec(new URL(url).pathname) || [])[1] || Date.now();
+  if (req.query.direct === "1")
+    return res.json({ ok: true, kind: "image", url: imgs[0], images: imgs, count: imgs.length });
+  try {
+    const r = await fetch(imgs[0], { signal: AbortSignal.timeout(60000) });
+    if (!r.ok) throw new Error(String(r.status));
+    res.setHeader("Content-Type", r.headers.get("content-type") || "image/jpeg");
+    res.setHeader("Content-Disposition", `attachment; filename="instagram-${code}.jpg"`);
+    const { Readable } = require("stream");
+    Readable.fromWeb(r.body).pipe(res);
+  } catch {
+    res.status(502).json({ error: "Instagram photo fetch failed" });
+  }
+}
 
 // The app calls this on every start with the versionCode it is actually running.
 // The server does the comparison and logs the check-in, so "is that phone on the

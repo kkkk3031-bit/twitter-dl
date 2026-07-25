@@ -279,6 +279,52 @@ function siteUrl(input, hostRe) {
   return u.toString();
 }
 
+// A URL is safe for this box to fetch — or to hand to the app — only when it is
+// plain http(s) and every address it resolves to is public. The literal text
+// check alone is not enough: a perfectly public-looking hostname can resolve to
+// a private address, and that is exactly how an SSRF gets past a regex.
+const PRIVATE_IP =
+  /^(?:10\.|127\.|0\.|169\.254\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|::1$|fc|fd|fe80:)/i;
+
+async function publicUrl(input) {
+  let u;
+  try {
+    u = new URL(String(input || ""));
+  } catch {
+    return null;
+  }
+  if (!/^https?:$/.test(u.protocol)) return null;
+  const host = u.hostname.replace(/^\[|\]$/g, "");
+  if (host === "localhost" || PRIVATE_IP.test(host)) return null;
+  try {
+    const addrs = await require("dns").promises.lookup(host, { all: true });
+    if (addrs.some((a) => PRIVATE_IP.test(a.address))) return null;
+  } catch {
+    return null;
+  }
+  return u.toString();
+}
+
+// fetch() follows redirects by itself, which would walk straight past the check
+// above — a public link that answers 302 with an internal address still ends up
+// fetched. So the hops are walked by hand and every one of them is re-checked.
+async function fetchPublic(input, headers, hops = 5) {
+  let target = input;
+  for (let i = 0; i < hops; i++) {
+    const safe = await publicUrl(target);
+    if (!safe) throw new Error("blocked");
+    const r = await fetch(safe, {
+      headers,
+      redirect: "manual",
+      signal: AbortSignal.timeout(180000),
+    });
+    const loc = r.status >= 300 && r.status < 400 && r.headers.get("location");
+    if (!loc) return r;
+    target = new URL(loc, safe).toString();
+  }
+  throw new Error("too many redirects");
+}
+
 // Maps a yt-dlp failure to an honest HTTP answer. A photo-only post is a
 // correct answer, not a failure — say so plainly instead of blaming the
 // network (same honesty as /api/video for text-only tweets).
@@ -410,31 +456,22 @@ app.get("/api/sites", rateLimit(60), (_req, res) =>
 //   3. yt-dlp streaming through this box (last resort, costs bandwidth)
 // direct=1 answers with JSON for the app; a plain call redirects to the link so
 // a browser just downloads it.
-app.get("/api/convert", rateLimit(10), (req, res) => {
+app.get("/api/convert", rateLimit(10), async (req, res) => {
   const url = siteUrl(req.query.url, /.*/);
   if (!url) return res.status(400).json({ error: "Not a valid link" });
-  let host;
-  try {
-    host = new URL(url).hostname;
-  } catch {
-    return res.status(400).json({ error: "Not a valid link" });
-  }
-  // Never let a pasted link point this server at its own network. The literal
-  // check is not enough on its own — a public hostname can resolve to a private
-  // address — so the resolved IPs are checked too, below.
-  if (/^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.|169\.254\.|\[?::1)/i.test(host))
+  // Never let a pasted link point this server at its own network.
+  if (!(await publicUrl(url)))
     return res.status(400).json({ error: "Not a valid link" });
 
   const site = siteLabel(url);
   const wantJson = req.query.direct === "1";
 
-  // A public hostname is allowed to resolve wherever it likes — including this
-  // box's own network — so the addresses are checked, not just the text.
-  const privateIp = (ip) =>
-    /^(10\.|127\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$|f[cd])/i.test(ip);
-
   const tryBrowser = async () => {
     const r = await convertViaWeb(url);
+    // The converter hands back a second link that this box is about to fetch —
+    // or that the app will — so it earns the same address check the pasted link
+    // got. A converter can be pointed back at our own network just as easily.
+    if (r && r.url && !(await publicUrl(r.url))) r.url = null;
     if (r && r.url) {
       // The app gets the link plus the headers that make it work, and pulls the
       // bytes itself. A browser cannot attach someone else's cookies to a plain
@@ -442,7 +479,7 @@ app.get("/api/convert", rateLimit(10), (req, res) => {
       if (wantJson)
         return res.json({ ok: true, url: r.url, via: r.via, site, headers: r.headers || {} });
       try {
-        const up = await fetch(r.url, { headers: r.headers || {}, signal: AbortSignal.timeout(180000) });
+        const up = await fetchPublic(r.url, r.headers || {});
         if (!up.ok) throw new Error(String(up.status));
         res.setHeader("Content-Type", "video/mp4");
         res.setHeader("Content-Disposition", `attachment; filename="${site.toLowerCase()}-video.mp4"`);
@@ -460,23 +497,19 @@ app.get("/api/convert", rateLimit(10), (req, res) => {
     return ytdlpToClient(res, url, site);
   };
 
-  require("dns").promises
-    .lookup(host, { all: true })
-    .then((addrs) => {
-      if (addrs.some((a) => privateIp(a.address))) throw new Error("private");
-      const args = [url, "-g", "-f", "mp4/best", "--no-playlist", "--no-warnings"];
-      execFile(YTDLP, args, { timeout: 45000 }, (err, stdout) => {
-        const direct = String(stdout || "").trim().split("\n")[0];
-        if (!err && /^https:\/\//.test(direct)) {
-          if (wantJson) return res.json({ ok: true, url: direct, via: "yt-dlp", site });
-          return res.redirect(302, direct);
-        }
-        tryBrowser().catch(() =>
-          res.status(502).json({ error: `${site}: conversion failed` })
-        );
-      });
-    })
-    .catch(() => res.status(400).json({ error: "Not a valid link" }));
+  // Tier 1: yt-dlp's own signed link. It resolves the host itself, so what it
+  // returns is checked before it is passed on rather than trusted outright.
+  const args = [url, "-g", "-f", "mp4/best", "--no-playlist", "--no-warnings"];
+  execFile(YTDLP, args, { timeout: 45000 }, async (err, stdout) => {
+    const direct = String(stdout || "").trim().split("\n")[0];
+    if (!err && /^https:\/\//.test(direct) && (await publicUrl(direct))) {
+      if (wantJson) return res.json({ ok: true, url: direct, via: "yt-dlp", site });
+      return res.redirect(302, direct);
+    }
+    tryBrowser().catch(() =>
+      res.status(502).json({ error: `${site}: conversion failed` })
+    );
+  });
 });
 
 app.get("/api/tiktok", rateLimit(15), (req, res) => {
@@ -644,4 +677,10 @@ app.get("/api/mp3", rateLimit(5), async (req, res) => {
 });
 
 const PORT = parseInt(process.env.PORT || "4310", 10);
-app.listen(PORT, () => console.log(`twitter-dl on http://localhost:${PORT}`));
+// Only bind a port when this file is the program. Required as a module it just
+// hands over the pieces worth testing on their own — the address guard above is
+// the kind of thing that has to be provable, not eyeballed.
+if (require.main === module)
+  app.listen(PORT, () => console.log(`twitter-dl on http://localhost:${PORT}`));
+
+module.exports = { app, publicUrl, fetchPublic };

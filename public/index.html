@@ -110,7 +110,7 @@ let comments = null, commentsVia = "";
 // Replies come from a public mirror the server drives with a headless browser,
 // so the first call pays that mirror's bot-check (~15s) and later ones are cached.
 async function loadComments(id, btn) {
-  btn.disabled = true; btn.textContent = "Loading replies… (~15s)";
+  btn.disabled = true; btn.textContent = "Loading whole thread…";
   try {
     const r = await fetch(`/api/comments?url=${encodeURIComponent("https://x.com/i/status/"+id)}`);
     const d = await r.json();
@@ -127,7 +127,7 @@ async function loadComments(id, btn) {
 
 function renderComments(d) {
   const box = $("comments");
-  box.innerHTML = `<div class="chead">${d.count} replies${d.partial?" (first pages)":""} · via ${esc(d.via)} · no login</div>` +
+  box.innerHTML = `<div class="chead">${d.count} replies${d.partial?" (capped — huge thread)":" · whole thread"} · via ${esc(d.via)} · no login</div>` +
     d.replies.map(r => `<div class="c"><div class="ch">@${esc(r.handle)}` +
       `<span class="cd">${esc(r.date||"")}</span></div>` +
       `<div class="ct">${esc(r.text||"")}</div>` +
@@ -151,7 +151,7 @@ function markdown(d) {
   if (d.images.length) m += `\n## Image URLs\n\n` + d.images.map(u=>`- ${u}?name=orig`).join("\n") + "\n";
   m += `\n## Comments / replies\n\n`;
   if (comments && comments.length) {
-    m += `_${comments.length} replies via ${commentsVia||"public mirror"}, no login_\n\n`;
+    m += `_${comments.length} replies (whole thread) via ${commentsVia||"public mirror"}, no login_\n\n`;
     m += comments.map(r =>
       `- **@${r.handle}**${r.date?` · ${r.date}`:""}` +
       `${r.replying_to&&r.replying_to.length?` ↩ ${r.replying_to.join(" ")}`:""}` +
@@ -190,7 +190,7 @@ function render(d) {
   d.images.forEach((u,i)=> b.push(`<a href="/api/image?u=${encodeURIComponent(u)}">Image ${i+1}</a>`));
   if (d.has_video) b.push(`<a href="/api/video?url=${encodeURIComponent('https://x.com/i/status/'+d.id)}">Download video</a>`);
   $("btns").innerHTML = b.join("");
-  $("note").innerHTML = `<b>Load comments</b> pulls the full reply thread — no X login, no cookies (first load ~15s, then instant). <b>AI markdown</b> gives a clean file for Claude, replies included. <span class="rtl">التعليقات بدون تسجيل دخول</span>`;
+  $("note").innerHTML = `<b>Load comments</b> walks the <b>whole</b> reply tree — every sub-thread, no X login, no cookies (a few seconds, then instant). <b>AI markdown</b> gives a clean file for Claude, replies included. <span class="rtl">التعليقات بدون تسجيل دخول</span>`;
   $("card").style.display = "block";
 }
 function esc(s){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }

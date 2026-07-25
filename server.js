@@ -187,8 +187,10 @@ app.get("/api/comments", rateLimit(10), async (req, res) => {
       const t = await fetchTweet(id).catch(() => null);
       handle = t?.user?.screen_name || (await fetchFx(id).catch(() => null))?.author?.screen_name || "";
     }
+    // deep=0 → just the first thread page (fast); default walks the whole tree.
     const r = await fetchCommentsNoLogin(id, handle, {
-      maxPages: Math.min(5, Math.max(1, Number(req.query.pages) || 3)),
+      deep: req.query.deep !== "0",
+      budgetMs: Math.min(120000, Math.max(10000, Number(req.query.budget) * 1000 || 60000)),
     });
     if (!r.ok) return res.status(502).json({ error: r.reason });
     res.json({
@@ -197,6 +199,7 @@ app.get("/api/comments", rateLimit(10), async (req, res) => {
       via: r.via,
       login_required: false,
       partial: !!r.partial,
+      pages_read: r.pages_read,
       count: r.replies.length,
       replies: r.replies,
     });

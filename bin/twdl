@@ -248,7 +248,7 @@ async function main() {
     const c = await fetchComments(id, u.screen_name);
     if (c.ok && c.replies.length) {
       md.push(
-        `_${c.replies.length} replies${c.partial ? " (first pages)" : ""}` +
+        `_${c.replies.length} replies${c.partial ? " (capped — thread is huge)" : " (full thread)"}` +
           `${c.via ? ` · via ${c.via}, no login` : " · via X login cookie"}_`,
         ``,
       );

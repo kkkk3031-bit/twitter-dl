@@ -23,10 +23,11 @@ const NAV_TIMEOUT = 45000;
 const CONTENT_TIMEOUT = 40000; // the proof-of-work wall can chew ~30s cold
 const WARM_TIMEOUT = 15000; // with the wall's cookie in hand it is ~1.5s
 const PAGE_NAV_TIMEOUT = 20000; // a deep "Load more" cursor makes the mirror re-fetch from X
-const BUDGET_MS = 45000; // total wall-clock for one conversation walk
+const BUDGET_MS = 60000; // total wall-clock for one conversation walk
 const IDLE_CLOSE_MS = 120000;
 const CACHE_MS = 5 * 60 * 1000;
-const MAX_PAGES = 5; // "Load more" hops; 20-ish replies a page
+const MAX_LOADS = 80; // thread pages opened per conversation, worst case
+const TABS = 2; // parallel tabs — more makes these small instances 503
 
 // Verified 2026-07-25: tiekoetter served a full 35-reply thread in 1.4s while
 // xcancel/lightbrd/nitter.space were failing their own bot checks. Order is a
@@ -120,6 +121,9 @@ function extractInPage() {
     return v ? Number(v) : 0;
   };
   const one = (el) => ({
+    // The permalink carries the reply's own status id — the dedupe key, and the
+    // address of its sub-thread.
+    id: (el.querySelector(".tweet-link")?.getAttribute("href") || "").match(/status\/(\d+)/)?.[1] || "",
     handle: text(el, ".username").replace(/^@/, ""),
     name: text(el, ".fullname"),
     date: el.querySelector(".tweet-date a")?.getAttribute("title") || "",
@@ -136,19 +140,15 @@ function extractInPage() {
   const items = [...document.querySelectorAll(".reply .timeline-item")].filter(
     (el) => !el.classList.contains("unavailable") && el.querySelector(".username"),
   );
-  const more = document.querySelector(".show-more:not(.timeline-item) a, .show-more a");
   return {
     main: mainEl ? one(mainEl) : null,
     replies: items.map(one),
-    // Nitter's "Load more" carries the cursor for the next page of replies.
-    nextHref: more && /cursor=/.test(more.getAttribute("href") || "") ? more.getAttribute("href") : null,
     blocked: !mainEl && !items.length,
     bodyStart: document.body.innerText.slice(0, 100).replace(/\s+/g, " "),
   };
 }
 
-async function scrapeMirror(host, id, handle, maxPages, opts = {}) {
-  const b = await getBrowser();
+async function openTab(b, host, cookies) {
   const page = await b.newPage();
   await page.setUserAgent(UA);
   page.setDefaultNavigationTimeout(NAV_TIMEOUT);
@@ -157,104 +157,134 @@ async function scrapeMirror(host, id, handle, maxPages, opts = {}) {
   page.on("request", (r) =>
     ["image", "font", "media"].includes(r.resourceType()) ? r.abort() : r.continue(),
   );
-
-  try {
-    const state = loadState();
-    const known = state.hosts[host] || {};
-    if (known.cookies?.length) {
-      try {
-        await page.setCookie(...known.cookies);
-      } catch {}
-    }
-
-    const replies = [];
-    let mainTweet = null;
-    let url = `https://${host}/${handle || "i"}/status/${id}`;
-    let solved = !!known.cookies?.length;
-    let partial = false;
-    // A mirror that has to re-fetch a deep cursor from X can sit there for
-    // minutes; the first page is what matters, so the whole walk gets a budget
-    // and hands back whatever it collected when the budget runs out.
-    const deadline = Date.now() + (opts.budgetMs || BUDGET_MS);
-    const seenCursors = new Set();
-
-    for (let p = 0; p < maxPages; p++) {
-      const left = deadline - Date.now();
-      if (p > 0 && left < 4000) {
-        partial = true;
-        break;
-      }
-      try {
-        await page.goto(url, {
-          waitUntil: "domcontentloaded",
-          timeout: p === 0 ? NAV_TIMEOUT : Math.max(5000, Math.min(PAGE_NAV_TIMEOUT, left)),
-        });
-      } catch (e) {
-        if (p === 0) throw e;
-        partial = true; // page 1 already in hand — a stalled cursor is not a failure
-        break;
-      }
-      try {
-        await page.waitForSelector(".main-tweet, .timeline-item", {
-          timeout: solved ? WARM_TIMEOUT : CONTENT_TIMEOUT,
-        });
-      } catch {}
-      const got = await page.evaluate(extractInPage);
-      if (got.blocked) {
-        if (p > 0) {
-          partial = true;
-          break;
-        }
-        return { ok: false, host, reason: `blocked by ${host} (${got.bodyStart.slice(0, 60)})` };
-      }
-      solved = true;
-      if (!mainTweet) mainTweet = got.main;
-      replies.push(...got.replies);
-      // Nitter can hand back the cursor it was just given — that would loop.
-      if (!got.nextHref || seenCursors.has(got.nextHref)) break;
-      seenCursors.add(got.nextHref);
-      url = new URL(got.nextHref, `https://${host}/`).href;
-      if (p === maxPages - 1) partial = true;
-    }
-
-    // Persist the wall's cookie so the next call skips the proof-of-work.
-    const cookies = await page.cookies();
-    state.hosts[host] = { lastOk: Date.now(), cookies };
-    saveState(state);
-
-    // Nitter repeats the focal tweet inside thread groups — drop those.
-    const seen = new Set();
-    const clean = replies.filter((r) => {
-      const k = `${r.handle}|${r.date}|${r.text}`;
-      if (seen.has(k) || (mainTweet && k === `${mainTweet.handle}|${mainTweet.date}|${mainTweet.text}`))
-        return false;
-      seen.add(k);
-      return true;
-    });
-    return { ok: true, host, main: mainTweet, replies: clean, partial };
-  } catch (e) {
-    return { ok: false, host, reason: `${host}: ${String(e.message).split("\n")[0]}` };
-  } finally {
+  if (cookies?.length) {
     try {
-      await page.close();
+      await page.setCookie(...cookies);
     } catch {}
   }
+  return page;
+}
+
+// One thread page → its visible replies. Nitter renders a reply's own sub-thread
+// only on that reply's page, which is what makes the walk below necessary.
+async function loadThread(page, host, handle, id, waitMs) {
+  await page.goto(`https://${host}/${handle || "i"}/status/${id}`, {
+    waitUntil: "domcontentloaded",
+  });
+  try {
+    await page.waitForSelector(".main-tweet, .timeline-item", { timeout: waitMs });
+  } catch {}
+  return page.evaluate(extractInPage);
+}
+
+// The whole conversation, not just the first page.
+//
+// Nitter's own "Load more" cursor is dead on every surviving mirror (it answers
+// 200 with an empty page — the instances have no auth tokens, which is also why
+// `conversation_id:` search 429s there), so paging is not the way in. The tree
+// is: the root page lists the replies, each reply that has replies of its own
+// links to a page listing those, and so on until the branches run out. Walking
+// it with a couple of tabs pulled 44 replies where page 1 showed 32.
+async function scrapeMirror(host, id, handle, opts = {}) {
+  const b = await getBrowser();
+  const state = loadState();
+  const known = state.hosts[host] || {};
+  const deep = opts.deep !== false;
+  const maxLoads = opts.maxLoads || MAX_LOADS;
+  const deadline = Date.now() + (opts.budgetMs || BUDGET_MS);
+  const firstWait = known.cookies?.length ? WARM_TIMEOUT : CONTENT_TIMEOUT;
+
+  const page = await openTab(b, host, known.cookies);
+  let root;
+  try {
+    root = await loadThread(page, host, handle, id, firstWait);
+  } catch (e) {
+    await page.close().catch(() => {});
+    return { ok: false, host, reason: `${host}: ${String(e.message).split("\n")[0]}` };
+  }
+  if (root.blocked) {
+    await page.close().catch(() => {});
+    return { ok: false, host, reason: `blocked by ${host} (${root.bodyStart.slice(0, 60)})` };
+  }
+
+  // The wall is solved for this host now — bank the cookie for next time.
+  try {
+    state.hosts[host] = { lastOk: Date.now(), cookies: await page.cookies() };
+    saveState(state);
+  } catch {}
+
+  const found = new Map(); // reply id → reply, in discovery order
+  const queue = []; // branches still to open
+  const expanded = new Set([id]);
+  let loads = 1;
+
+  const take = (items) => {
+    for (const r of items) {
+      if (!r.id || found.has(r.id) || r.id === id) continue;
+      found.set(r.id, r);
+      if (r.replies > 0 && !expanded.has(r.id)) queue.push(r);
+    }
+  };
+  take(root.replies);
+
+  if (deep && queue.length) {
+    // Two tabs: enough to hide the round-trip, gentle enough that the mirror
+    // does not start 503-ing (they are small boxes and rate-limit hard).
+    const tabs = [page];
+    for (let i = 1; i < Math.min(TABS, queue.length); i++) {
+      tabs.push(await openTab(b, host, known.cookies));
+    }
+    const worker = async (tab) => {
+      while (queue.length && Date.now() < deadline && loads < maxLoads) {
+        const node = queue.shift();
+        if (!node || expanded.has(node.id)) continue;
+        expanded.add(node.id);
+        loads++;
+        try {
+          const got = await loadThread(tab, host, node.handle, node.id, WARM_TIMEOUT);
+          if (!got.blocked) take(got.replies);
+        } catch {
+          // A single dead branch is not worth failing the whole conversation.
+        }
+      }
+    };
+    await Promise.all(tabs.map(worker));
+    for (const t of tabs.slice(1)) await t.close().catch(() => {});
+  }
+  await page.close().catch(() => {});
+
+  return {
+    ok: true,
+    host,
+    main: root.main,
+    replies: [...found.values()],
+    loads,
+    // Only genuinely incomplete if branches were left unopened.
+    partial: queue.length > 0,
+  };
 }
 
 // fetchCommentsNoLogin(id, handle) → { ok, replies:[...], via } | { ok:false, reason }
 async function fetchCommentsNoLogin(id, handle, opts = {}) {
-  const maxPages = opts.maxPages || MAX_PAGES;
-  const hit = cache.get(`${id}|${maxPages}`);
+  const deep = opts.deep !== false;
+  const hit = cache.get(`${id}|${deep ? "deep" : "fast"}`);
   if (hit && Date.now() - hit.ts < CACHE_MS) return hit.data;
 
   busy = true;
   const tried = [];
   try {
     for (const host of rankedMirrors()) {
-      const r = await scrapeMirror(host, id, handle, maxPages, opts);
+      const r = await scrapeMirror(host, id, handle, opts);
       if (r.ok) {
-        const data = { ok: true, via: host, main: r.main, replies: r.replies, partial: !!r.partial };
-        cache.set(`${id}|${maxPages}`, { data, ts: Date.now() });
+        const data = {
+          ok: true,
+          via: host,
+          main: r.main,
+          replies: r.replies,
+          partial: !!r.partial,
+          pages_read: r.loads,
+        };
+        cache.set(`${id}|${deep ? "deep" : "fast"}`, { data, ts: Date.now() });
         return data;
       }
       tried.push(r.reason);

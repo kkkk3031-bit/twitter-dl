@@ -736,7 +736,18 @@ const PORT = parseInt(process.env.PORT || "4310", 10);
 // Only bind a port when this file is the program. Required as a module it just
 // hands over the pieces worth testing on their own — the address guard above is
 // the kind of thing that has to be provable, not eyeballed.
-if (require.main === module)
-  app.listen(PORT, () => console.log(`twitter-dl on http://localhost:${PORT}`));
+if (require.main === module) {
+  const server = app.listen(PORT, () =>
+    console.log(`twitter-dl on http://localhost:${PORT}`));
+  // Losing a start race with another copy of ourselves is not a crash worth a
+  // stack trace — the copy that won is already serving. Say so in one line.
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`port ${PORT} already served by another twitter-dl — exiting`);
+      process.exit(0);
+    }
+    throw err;
+  });
+}
 
 module.exports = { app, publicUrl, fetchPublic };

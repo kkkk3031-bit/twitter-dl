@@ -551,9 +551,23 @@ async function igImageUrls(url) {
   if (!r.ok) return [];
   const html = await r.text();
   const out = [];
+  // Whatever comes out of a scraped page is somebody else's string, and this
+  // box turns it into a request — so only Instagram's own CDN gets through.
+  const igCdn = (u) => {
+    try {
+      const h = new URL(u);
+      return (
+        h.protocol === "https:" &&
+        /(^|\.)(cdninstagram\.com|fbcdn\.net|instagram\.com)$/i.test(h.hostname)
+      );
+    } catch {
+      return false;
+    }
+  };
   for (const mm of html.matchAll(/"display_url":"([^"]+)"/g)) {
     try {
-      out.push(JSON.parse(`"${mm[1]}"`));
+      const u = JSON.parse(`"${mm[1]}"`);
+      if (igCdn(u)) out.push(u);
     } catch {}
   }
   if (!out.length) {
@@ -562,7 +576,7 @@ async function igImageUrls(url) {
     // the post itself — dropping them is what separates photo from profile pic.
     for (const mm of html.matchAll(/src="(https:\/\/[^"]*scontent[^"]*t51[^"]*)"/g)) {
       const u = mm[1].replace(/&amp;/g, "&");
-      if (!/t51\.2885-19|s150x150|s100x100|profile_pic/.test(u)) out.push(u);
+      if (!/t51\.2885-19|s150x150|s100x100|profile_pic/.test(u) && igCdn(u)) out.push(u);
     }
   }
   return [...new Set(out)];
@@ -581,7 +595,7 @@ async function igPhotos(req, res, url) {
   if (req.query.direct === "1")
     return res.json({ ok: true, kind: "image", url: imgs[0], images: imgs, count: imgs.length });
   try {
-    const r = await fetch(imgs[0], { signal: AbortSignal.timeout(60000) });
+    const r = await fetchPublic(imgs[0], {});
     if (!r.ok) throw new Error(String(r.status));
     res.setHeader("Content-Type", r.headers.get("content-type") || "image/jpeg");
     res.setHeader("Content-Disposition", `attachment; filename="instagram-${code}.jpg"`);
@@ -645,7 +659,12 @@ app.get("/api/mp3", rateLimit(5), async (req, res) => {
         const dl = await fetch(YT_RAILWAY + "/download/" + jobId, { signal: AbortSignal.timeout(120000) });
         if (!dl.ok) throw new Error("download failed");
         const buf = Buffer.from(await dl.arrayBuffer());
-        const fname = st.filename || `youtube-${id}.mp3`;
+        // The name comes back from the converter service, and it is about to be
+        // a response header — a quote or a newline in it would break the header
+        // apart, so it gets the same scrub /api/image gives its filenames.
+        const fname = String(st.filename || `youtube-${id}.mp3`)
+          .replace(/[^\w.\- ]/g, "_")
+          .slice(0, 120) || `youtube-${id}.mp3`;
         res.setHeader("Content-Type", "audio/mpeg");
         res.setHeader("Content-Disposition", `attachment; filename="${fname}"`);
         return res.end(buf);

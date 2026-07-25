@@ -63,6 +63,41 @@ grep -q "^LOOP:" /tmp/ssrf-redir.$$ && ok "endless redirect chain terminates" \
   || bad "redirect loop did not terminate"
 rm -f /tmp/ssrf-redir.$$
 
+echo "── scraped URLs are not trusted either ──"
+node -e '
+// igImageUrls keeps only Instagram CDN hosts, so a poisoned embed page cannot
+// hand this box an arbitrary target. Exercised through the same regexes the
+// real scraper uses, on a page shaped like the one Instagram returns.
+const html = `
+  {"display_url":"https://scontent-lhr8-1.cdninstagram.com/v/real.jpg"}
+  {"display_url":"http://169.254.169.254/latest/meta-data/"}
+  {"display_url":"https://evil.example.com/x.jpg"}
+  {"display_url":"file:///etc/passwd"}
+`;
+const igCdn = (u) => { try { const h = new URL(u);
+  return h.protocol === "https:" &&
+    /(^|\.)(cdninstagram\.com|fbcdn\.net|instagram\.com)$/i.test(h.hostname);
+} catch { return false; } };
+const out = [];
+for (const mm of html.matchAll(/"display_url":"([^"]+)"/g)) {
+  try { const u = JSON.parse(`"${mm[1]}"`); if (igCdn(u)) out.push(u); } catch {}
+}
+console.log(out.length === 1 && out[0].includes("cdninstagram") ? "FILTERED" : "LEAKED:" + JSON.stringify(out));
+' > /tmp/ssrf-ig.$$ 2>&1
+grep -q "^FILTERED" /tmp/ssrf-ig.$$ && ok "poisoned embed page yields only IG CDN urls" \
+  || bad "embed filter leaked: $(cat /tmp/ssrf-ig.$$)"
+rm -f /tmp/ssrf-ig.$$
+
+# A filename from the converter service ends up in a response header; a newline
+# in it would split the header. setHeader throws on such a name, so the scrub
+# has to happen before it gets there.
+node -e '
+const raw = "song\r\nX-Injected: yes\".mp3";
+const f = String(raw).replace(/[^\w.\- ]/g, "_").slice(0, 120);
+console.log(/[\r\n"]/.test(f) ? "LEAKED:" + JSON.stringify(f) : "SCRUBBED");
+' | grep -q "^SCRUBBED" && ok "converter filename scrubbed before the header" \
+  || bad "filename scrub failed"
+
 echo "── allowed: a real public link still resolves ──"
 body=$(curl -s -m 90 "$BASE/api/convert?direct=1&url=$(enc 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')")
 case "$body" in

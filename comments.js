@@ -148,6 +148,23 @@ function extractInPage() {
   };
 }
 
+// Nitter prints "Jul 25, 2026 · 2:36 AM UTC"; V8 parses it once the dot is out.
+function toISO(d) {
+  if (!d) return null;
+  const t = Date.parse(String(d).replace(" · ", " "));
+  return Number.isNaN(t) ? null : new Date(t).toISOString();
+}
+
+// Every reply gets its real address on X, so the list is clickable and each
+// comment can be opened where it lives.
+function decorate(r) {
+  return {
+    ...r,
+    ts: toISO(r.date),
+    url: r.id && r.handle ? `https://x.com/${r.handle}/status/${r.id}` : null,
+  };
+}
+
 async function openTab(b, host, cookies) {
   const page = await b.newPage();
   await page.setUserAgent(UA);
@@ -253,11 +270,17 @@ async function scrapeMirror(host, id, handle, opts = {}) {
   }
   await page.close().catch(() => {});
 
+  // Read it the way it happened: the tweet first, then every reply in the order
+  // it was posted, regardless of which branch the walk found it on.
+  const replies = [...found.values()]
+    .map(decorate)
+    .sort((a, b2) => (a.ts && b2.ts ? Date.parse(a.ts) - Date.parse(b2.ts) : 0));
+
   return {
     ok: true,
     host,
-    main: root.main,
-    replies: [...found.values()],
+    main: root.main ? decorate({ ...root.main, id: root.main.id || id, handle: root.main.handle || handle }) : null,
+    replies,
     loads,
     // Only genuinely incomplete if branches were left unopened.
     partial: queue.length > 0,

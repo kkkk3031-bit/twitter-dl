@@ -264,7 +264,8 @@ async function main() {
         md.push(
           `- **@${r.handle}**${r.date ? ` · ${r.date}` : ""}${to} (${st}): ` +
             `${(r.text || "").replace(/\n/g, " ")}` +
-            `${r.images?.length ? ` [img: ${r.images.length}]` : ""}`,
+            `${r.images?.length ? ` [img: ${r.images.length}]` : ""}` +
+            `${r.url ? `\n  ${r.url}` : ""}`,
         );
       });
     } else if (c.ok) md.push(`_No replies returned._`);

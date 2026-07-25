@@ -201,6 +201,10 @@ app.get("/api/comments", rateLimit(10), async (req, res) => {
       partial: !!r.partial,
       pages_read: r.pages_read,
       count: r.replies.length,
+      // The tweet itself, so a client can render the conversation from the
+      // person who started it down to the last reply on one page.
+      main: r.main,
+      url: `https://x.com/${handle || "i"}/status/${id}`,
       replies: r.replies,
     });
   } catch (e) {

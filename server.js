@@ -387,7 +387,10 @@ function ytdlpError(res, stderr, site) {
 // pull the file first. Only offered for Instagram: its signed links serve from
 // any IP with no headers, while TikTok's CDN 403s anything but the session that
 // extracted them (verified both ways), which is why /api/tiktok streams instead.
-function ytdlpDirectUrl(res, url, site, onNoVideo) {
+// onFail (unlike onNoVideo, which is only "this post has no video") runs on ANY
+// yt-dlp failure, so a caller can hand the link to the converter bridge instead
+// of turning an extractor gap into a dead end for the user.
+function ytdlpDirectUrl(res, url, site, onNoVideo, onFail) {
   if (videoJobs >= 2)
     return res.status(429).json({ error: "Busy with other downloads — try again shortly." });
   videoJobs++;
@@ -396,15 +399,15 @@ function ytdlpDirectUrl(res, url, site, onNoVideo) {
     videoJobs--;
     if (err && onNoVideo && /no video in this post|there is no video/i.test(String(stderr)))
       return onNoVideo();
-    if (err) return ytdlpError(res, stderr, site);
+    if (err) return onFail ? onFail() : ytdlpError(res, stderr, site);
     const direct = String(stdout || "").trim().split("\n")[0];
     if (!/^https:\/\//.test(direct))
-      return res.status(502).json({ error: `${site}: no direct link found` });
+      return onFail ? onFail() : res.status(502).json({ error: `${site}: no direct link found` });
     res.json({ ok: true, url: direct });
   });
 }
 
-function ytdlpToClient(res, url, site, onNoVideo) {
+function ytdlpToClient(res, url, site, onNoVideo, onFail) {
   if (videoJobs >= 2)
     return res.status(429).json({ error: "Busy with other downloads — try again shortly." });
   videoJobs++;
@@ -430,7 +433,7 @@ function ytdlpToClient(res, url, site, onNoVideo) {
       cleanup();
       if (onNoVideo && /no video in this post|there is no video/i.test(String(stderr)))
         return onNoVideo();
-      return ytdlpError(res, stderr, site);
+      return onFail ? onFail() : ytdlpError(res, stderr, site);
     }
     try {
       const files = (await fsp.readdir(job)).filter((f) => !f.endsWith(".part"));
@@ -446,18 +449,56 @@ function ytdlpToClient(res, url, site, onNoVideo) {
   });
 }
 
+// Tiers 2 and 3 of the converter, reusable: drive a headless browser through an
+// online converter for what yt-dlp cannot extract, and carry the bytes ourselves
+// only if that fails too. Every endpoint that can hit an extractor gap routes
+// here instead of answering "not supported".
+async function convertBridge(res, url, site, wantJson) {
+  const r = await convertViaWeb(url);
+  // The converter hands back a second link that this box is about to fetch —
+  // or that the app will — so it earns the same address check the pasted link
+  // got. A converter can be pointed back at our own network just as easily.
+  if (r && r.url && !(await publicUrl(r.url))) r.url = null;
+  if (r && r.url) {
+    // The app gets the link plus the headers that make it work, and pulls the
+    // bytes itself. A browser cannot attach someone else's cookies to a plain
+    // download, so for the web UI this box streams it through instead.
+    if (wantJson)
+      return res.json({ ok: true, url: r.url, via: r.via, site, headers: r.headers || {} });
+    try {
+      const up = await fetchPublic(r.url, r.headers || {});
+      if (!up.ok) throw new Error(String(up.status));
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Content-Disposition", `attachment; filename="${site.toLowerCase()}-video.mp4"`);
+      const len = up.headers.get("content-length");
+      if (len) res.setHeader("Content-Length", len);
+      const { Readable } = require("stream");
+      return Readable.fromWeb(up.body).pipe(res);
+    } catch {
+      return ytdlpToClient(res, url, site);
+    }
+  }
+  // Tier 3: nothing direct worked — carry the bytes ourselves.
+  if (wantJson)
+    return res.status(502).json({ error: `${site}: no direct link found — try the in-app download.` });
+  return ytdlpToClient(res, url, site);
+}
+
 // ── multi-site converter ───────────────────────────────────────────────────
 // Everything yt-dlp can pull that is not one of the four first-class sites.
 // The host list is an allowlist on purpose: this endpoint hands a user-supplied
 // URL to a subprocess, so "any URL" would be an SSRF hole aimed at the VPS's own
 // network. Adding a site is one entry here — nothing else changes.
 const MEDIA_HOSTS =
-  /^(?:.*\.)?(facebook\.com|fb\.watch|fb\.com|reddit\.com|redd\.it|pinterest\.[a-z.]{2,6}|pin\.it|snapchat\.com|twitch\.tv|vimeo\.com|dailymotion\.com|dai\.ly|kick\.com|tumblr\.com|threads\.net|threads\.com|streamable\.com|imgur\.com|rumble\.com|odysee\.com|bilibili\.com|ok\.ru|vk\.com|soundcloud\.com|9gag\.com|likee\.video|linkedin\.com|bsky\.app|twitch\.com)$/i;
+  /^(?:.*\.)?(facebook\.com|fb\.watch|fb\.com|reddit\.com|redd\.it|pinterest\.[a-z.]{2,6}|pin\.it|snapchat\.com|twitch\.tv|vimeo\.com|dailymotion\.com|dai\.ly|kick\.com|tumblr\.com|threads\.net|threads\.com|streamable\.com|imgur\.com|rumble\.com|odysee\.com|bilibili\.com|ok\.ru|vk\.com|soundcloud\.com|9gag\.com|likee\.video|linkedin\.com|bsky\.app|twitch\.com|douyin\.com|iesdouyin\.com|weibo\.com|weibo\.cn|xiaohongshu\.com|xhslink\.com|kuaishou\.com|t\.me|telegram\.me|rutube\.ru|trovo\.live|medal\.tv|mixcloud\.com|bandcamp\.com|loom\.com|coub\.com|nicovideo\.jp|bigo\.tv|sendvid\.com|streamff\.com|ted\.com)$/i;
 
 const SITE_LIST = [
   "Facebook", "Reddit", "Pinterest", "Snapchat", "Twitch", "Vimeo", "Dailymotion",
   "Kick", "Tumblr", "Threads", "Streamable", "Imgur", "Rumble", "Odysee",
   "Bilibili", "OK.ru", "VK", "SoundCloud", "9GAG", "Likee", "LinkedIn", "Bluesky",
+  "Douyin", "Weibo", "Xiaohongshu (RedNote)", "Kuaishou", "Telegram", "Rutube",
+  "Trovo", "Medal.tv", "Mixcloud", "Bandcamp", "Loom", "Coub", "Niconico",
+  "Bigo Live", "Sendvid", "Streamff", "TED",
 ];
 
 function siteLabel(u) {
@@ -481,8 +522,14 @@ app.get("/api/media", rateLimit(15), (req, res) => {
       supported: SITE_LIST,
     });
   const site = siteLabel(url);
-  if (req.query.direct === "1") return ytdlpDirectUrl(res, url, site);
-  ytdlpToClient(res, url, site);
+  const wantJson = req.query.direct === "1";
+  // An extractor gap on an allowlisted site is not the end of the road: hand the
+  // link to the same headless-browser converter bridge /api/convert uses. Sites
+  // yt-dlp has no extractor for (or lost one to a site redesign) still download.
+  const bridge = () => convertBridge(res, url, site, wantJson).catch(() =>
+    res.status(502).json({ error: `${site}: conversion failed` }));
+  if (wantJson) return ytdlpDirectUrl(res, url, site, null, bridge);
+  ytdlpToClient(res, url, site, null, bridge);
 });
 
 // So the app and the web UI can show the real list instead of hard-coding it.
@@ -507,36 +554,7 @@ app.get("/api/convert", rateLimit(10), async (req, res) => {
   const site = siteLabel(url);
   const wantJson = req.query.direct === "1";
 
-  const tryBrowser = async () => {
-    const r = await convertViaWeb(url);
-    // The converter hands back a second link that this box is about to fetch —
-    // or that the app will — so it earns the same address check the pasted link
-    // got. A converter can be pointed back at our own network just as easily.
-    if (r && r.url && !(await publicUrl(r.url))) r.url = null;
-    if (r && r.url) {
-      // The app gets the link plus the headers that make it work, and pulls the
-      // bytes itself. A browser cannot attach someone else's cookies to a plain
-      // download, so for the web UI this box streams it through instead.
-      if (wantJson)
-        return res.json({ ok: true, url: r.url, via: r.via, site, headers: r.headers || {} });
-      try {
-        const up = await fetchPublic(r.url, r.headers || {});
-        if (!up.ok) throw new Error(String(up.status));
-        res.setHeader("Content-Type", "video/mp4");
-        res.setHeader("Content-Disposition", `attachment; filename="${site.toLowerCase()}-video.mp4"`);
-        const len = up.headers.get("content-length");
-        if (len) res.setHeader("Content-Length", len);
-        const { Readable } = require("stream");
-        return Readable.fromWeb(up.body).pipe(res);
-      } catch {
-        return ytdlpToClient(res, url, site);
-      }
-    }
-    // Tier 3: nothing direct worked — carry the bytes ourselves.
-    if (wantJson)
-      return res.status(502).json({ error: `${site}: no direct link found — try the in-app download.` });
-    return ytdlpToClient(res, url, site);
-  };
+  const tryBrowser = () => convertBridge(res, url, site, wantJson);
 
   // Tier 1: yt-dlp's own signed link. It resolves the host itself, so what it
   // returns is checked before it is passed on rather than trusted outright.

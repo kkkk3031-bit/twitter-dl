@@ -45,7 +45,15 @@ const DL = path.join(__dirname, "downloads");
 fs.mkdirSync(DL, { recursive: true });
 const YTDLP = path.join(os.homedir(), "bin", "yt-dlp");
 const COOKIES = path.join(os.homedir(), ".config", "twdl", "cookies.txt");
-const YT_RAILWAY = "https://youtube-mp3-downloader-production-c1e2.up.railway.app";
+// Separate jar: the X cookies above are no use to YouTube. Optional — the
+// yt-dlp fallback runs without it, just with worse odds against the bot wall.
+const YT_COOKIES = path.join(os.homedir(), ".config", "twdl", "youtube-cookies.txt");
+// eta.etacloud.org is the y2mate.gs engine, reached directly. See /api/mp3.
+const ETA_BASE = "https://eta.etacloud.org/api/v1";
+const ETA_REF = "https://y2mate.gs/";
+const ETA_ORI = "https://y2mate.gs";
+const ETA_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
@@ -694,45 +702,91 @@ app.get("/api/kdl-check", rateLimit(60), (req, res) => {
   });
 });
 
-// YouTube → MP3 via yt-dlp (Railway API primary, local fallback).
+// YouTube → MP3 via the etacloud converter (primary), local yt-dlp (fallback).
+//
+// This used to lead with a Railway service, but that trial lapsed and every
+// /start now answers 404, so the primary was a guaranteed three-second detour.
+// etacloud (the engine behind y2mate.gs) converts on its own machines, which is
+// what makes it the right primary here: YouTube bot-walls this VPS's datacenter
+// IP — a local yt-dlp run gets LOGIN_REQUIRED on most videos regardless of
+// player client, POT provider, or JS runtime. Local extraction stays as the
+// fallback because it does still win on the occasional video etacloud misses.
 app.get("/api/mp3", rateLimit(5), async (req, res) => {
   const u = String(req.query.url || "");
   const m = u.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([\w-]{11})/);
   if (!m) return res.status(400).json({ error: "Not a valid YouTube link" });
   const id = m[1];
-  // Railway job flow (fast, has cookies)
   try {
-    const r = await fetch(YT_RAILWAY + "/start", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: u }),
-      signal: AbortSignal.timeout(15000),
-    });
-    const j = await r.json();
-    const jobId = j.job_id;
-    if (!jobId) throw new Error("no job_id");
-    for (let i = 0; i < 150; i++) {
-      await new Promise(r2 => setTimeout(r2, 2000));
-      const s = await fetch(YT_RAILWAY + "/status/" + jobId, { signal: AbortSignal.timeout(10000) });
-      const st = await s.json();
-      if (st.status === "done") {
-        const dl = await fetch(YT_RAILWAY + "/download/" + jobId, { signal: AbortSignal.timeout(120000) });
-        if (!dl.ok) throw new Error("download failed");
-        const buf = Buffer.from(await dl.arrayBuffer());
-        // The name comes back from the converter service, and it is about to be
-        // a response header — a quote or a newline in it would break the header
-        // apart, so it gets the same scrub /api/image gives its filenames.
-        const fname = String(st.filename || `youtube-${id}.mp3`)
-          .replace(/[^\w.\- ]/g, "_")
-          .slice(0, 120) || `youtube-${id}.mp3`;
-        res.setHeader("Content-Type", "audio/mpeg");
-        res.setHeader("Content-Disposition", `attachment; filename="${fname}"`);
-        return res.end(buf);
-      }
-      if (st.status === "error") throw new Error(st.error || "convert failed");
+    // Every etacloud call has to carry UA + Referer + Origin: y2mate.gs —
+    // omitting Origin gets empty 200s back from /init rather than an error.
+    const etaGet = async (url, key, timeout = 25000) => {
+      const headers = {
+        "User-Agent": ETA_UA,
+        "Accept": "application/json,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": ETA_REF,
+        "Origin": ETA_ORI,
+      };
+      if (key) headers.Authorization = `Bearer ${key}`;
+      const r = await fetch(url, { headers, signal: AbortSignal.timeout(timeout) });
+      const t = await r.text();
+      try { return JSON.parse(t); }
+      catch { throw new Error(`etacloud ${r.status}: ${t.slice(0, 60)}`); }
+    };
+
+    const ts = Date.now();
+    const { key } = await etaGet(`${ETA_BASE}/auth?_=${ts}`);
+    if (!key) throw new Error("etacloud auth: no key");
+
+    const init = await etaGet(`${ETA_BASE}/init?_=${ts}`, key);
+    const convertUrl = String(init.convertURL || "").split("&v=")[0];
+    if (!convertUrl) throw new Error("etacloud init: no convertURL");
+
+    let conv = await etaGet(`${convertUrl}&v=${id}&f=mp3&_=${ts}`, null, 45000);
+    // A busy node hands the job to a sibling: redirectURL, no downloadURL yet.
+    for (let i = 0; i < 2; i++) {
+      const redir = String(conv.redirectURL || "").split("&v=")[0];
+      if (conv.downloadURL || !redir) break;
+      conv = await etaGet(`${redir}&v=${id}&f=mp3&_=${Date.now()}`, null, 60000);
     }
-    throw new Error("timeout");
+    if (!conv.downloadURL) throw new Error(`etacloud convert: ${JSON.stringify(conv).slice(0, 80)}`);
+
+    // progress >= 3 means the file is ready. Cached videos pass instantly;
+    // a fresh one converts on etacloud's side and can take ~2 minutes.
+    let title = conv.title || "";
+    if (conv.progressURL) {
+      let ready = false;
+      for (let i = 0; i < 40 && !ready; i++) {
+        const pr = await etaGet(`${conv.progressURL}&_=${Date.now()}`, null, 15000);
+        if (pr.title) title = pr.title;
+        if (pr.error) throw new Error(`etacloud progress error=${pr.error}`);
+        ready = Number(pr.progress || 0) >= 3;
+        if (!ready) await new Promise(r2 => setTimeout(r2, 3000));
+      }
+      if (!ready) throw new Error("etacloud timeout (progress never reached 3)");
+    }
+
+    const dl = await fetch(`${conv.downloadURL}&v=${id}&f=mp3&r=y2mate.gs`, {
+      headers: { "User-Agent": ETA_UA, "Referer": ETA_REF, "Origin": ETA_ORI },
+      signal: AbortSignal.timeout(180000),
+    });
+    if (!dl.ok) throw new Error(`etacloud download HTTP ${dl.status}`);
+    const buf = Buffer.from(await dl.arrayBuffer());
+    // An HTML error page would sail through as a 200 and land in the user's
+    // Music folder named .mp3, so the bytes get checked before they are sent.
+    if (buf.length < 40000) throw new Error(`etacloud download too small (${buf.length}B)`);
+
+    // The name comes back from the converter service, and it is about to be
+    // a response header — a quote or a newline in it would break the header
+    // apart, so it gets the same scrub /api/image gives its filenames.
+    const fname = (String(title || `youtube-${id}`)
+      .replace(/[^\w.\- ]/g, "_")
+      .slice(0, 120) || `youtube-${id}`) + ".mp3";
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Disposition", `attachment; filename="${fname}"`);
+    return res.end(buf);
   } catch (e) {
-    // Railway failed — try local yt-dlp as fallback
+    // etacloud failed — try local yt-dlp as fallback
     if (videoJobs >= 2)
       return res.status(429).json({ error: "Busy — try again shortly." });
     videoJobs++;
@@ -743,10 +797,19 @@ app.get("/api/mp3", rateLimit(5), async (req, res) => {
       "--no-playlist", "--force-overwrites",
       "--ffmpeg-location", path.join(os.homedir(), "bin"),
     ];
-    if (fs.existsSync(COOKIES)) args.push("--cookies", COOKIES);
-    execFile(YTDLP, args, { timeout: 300000 }, (err) => {
+    // COOKIES is the X/Twitter jar — it holds nothing YouTube will accept, and
+    // handing yt-dlp an unrelated cookie file is not what unblocks a bot wall.
+    if (fs.existsSync(YT_COOKIES)) args.push("--cookies", YT_COOKIES);
+    execFile(YTDLP, args, { timeout: 300000 }, (err, _stdout, stderr) => {
       videoJobs--;
-      if (err) return res.status(502).json({ error: "MP3 download failed: " + e.message });
+      // Report the error that actually stopped the download. Reporting `e` here
+      // — the primary's failure — is what made this look like a converter
+      // outage in the logs while the real message sat in yt-dlp's stderr.
+      if (err) {
+        const why = String(stderr || "").split("\n").filter(l => l.startsWith("ERROR:")).pop()
+          || err.message;
+        return res.status(502).json({ error: `MP3 download failed: ${why.slice(0, 200)} (primary: ${e.message})` });
+      }
       const file = path.join(DL, `yt-${id}.mp3`);
       if (!fs.existsSync(file)) return res.status(404).json({ error: "no file produced" });
       res.download(file, `youtube-${id}.mp3`, () => fs.unlink(file, () => {}));

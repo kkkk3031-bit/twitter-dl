@@ -446,7 +446,6 @@ function ytdlpToClient(res, url, site, onNoVideo, onFail) {
   ];
   execFile(YTDLP, args, { timeout: 180000 }, async (err, stdout, stderr) => {
     videoJobs--;
-    console.log(`[yt-dlp] ${new Date().toISOString()} err=${err?.message?.slice(0,80)||"none"} stderr=${String(stderr||"").slice(0,120)}`);
     if (err) {
       cleanup();
       if (onNoVideo && /no video in this post|there is no video/i.test(String(stderr)))
@@ -635,7 +634,6 @@ app.get("/api/ytmp4", rateLimit(4), async (req, res) => {
 });
 
 app.get("/api/tiktok", rateLimit(15), (req, res) => {
-  console.log(`[tiktok] ${new Date().toISOString()} ip=${req.ip} ua=${(req.headers["user-agent"]||"").slice(0,40)}`);
   const url = siteUrl(req.query.url, /(^|\.)tiktok\.com$/i);
   if (!url) return res.status(400).json({ error: "Not a valid TikTok link" });
   ytdlpToClient(res, url, "TikTok");

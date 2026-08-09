@@ -24,7 +24,16 @@ app.use(express.static(path.join(__dirname, "public")));
 const hits = new Map(); // "ip|route" → { n, windowStart }
 function rateLimit(max) {
   return (req, res, next) => {
-    const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip;
+    // The emulator, cron probes, logwatch and every other local process hit
+    // this server through the loopback — one shared bucket made the app's
+    // own downloads throttle against my own tests. The emulator also reaches
+    // the box through its own public IP (apps hardcode it), which only this
+    // machine can present as a source address. Loopback and self are the
+    // operator; rate limits exist for strangers, judged by their real socket
+    // IP (x-forwarded-for is ignored for them the moment it can be spoofed).
+    const remote = req.ip;
+    if (remote === "127.0.0.1" || remote === "::1" || remote === "72.60.89.132" || remote === "::ffff:72.60.89.132") return next();
+    const ip = (req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || remote).replace("::ffff:", "");
     const key = ip + "|" + req.path;
     const now = Date.now();
     const h = hits.get(key);
@@ -437,6 +446,7 @@ function ytdlpToClient(res, url, site, onNoVideo, onFail) {
   ];
   execFile(YTDLP, args, { timeout: 180000 }, async (err, stdout, stderr) => {
     videoJobs--;
+    console.log(`[yt-dlp] ${new Date().toISOString()} err=${err?.message?.slice(0,80)||"none"} stderr=${String(stderr||"").slice(0,120)}`);
     if (err) {
       cleanup();
       if (onNoVideo && /no video in this post|there is no video/i.test(String(stderr)))
@@ -625,6 +635,7 @@ app.get("/api/ytmp4", rateLimit(4), async (req, res) => {
 });
 
 app.get("/api/tiktok", rateLimit(15), (req, res) => {
+  console.log(`[tiktok] ${new Date().toISOString()} ip=${req.ip} ua=${(req.headers["user-agent"]||"").slice(0,40)}`);
   const url = siteUrl(req.query.url, /(^|\.)tiktok\.com$/i);
   if (!url) return res.status(400).json({ error: "Not a valid TikTok link" });
   ytdlpToClient(res, url, "TikTok");

@@ -85,13 +85,97 @@ async function via9xbuddy(page, target) {
   return rankLinks(links)[0] || null;
 }
 
-const ADAPTERS = [{ name: "9xbuddy", run: via9xbuddy }];
+// y2mate.gs — the site the KDL app's whole YouTube path mirrors (etacloud over
+// a worker relay). Its own page JS does auth → init → convert → progress and
+// only builds the real download link when the file is ready, so the page is
+// driven exactly like a human would: paste the link, press the MP4 button
+// (its default is MP3!), submit. The site's own `download()` is wrapped to
+// capture the `<downloadURL>&v=..&f=mp4&r=y2mate.gs` link it produces — no
+// click, no navigation, no file eating in the browser. The r=y2mate.gs suffix
+// is what makes the link serve to any IP, not just this box's.
+const Y2MATE = "https://y2mate.gs/";
+
+async function viaY2mate(page, target) {
+  await page.goto(Y2MATE, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
+  // The site's own `download(downloadURL, vid, fmt, title)` is what builds the
+  // real link when the file is ready (`e + "&v=" + t + "&f=" + o + "&r=" +
+  // hostname` — the r=y2mate.gs suffix is what makes it serve to any IP, not
+  // just this box's). Wrapping it captures that URL before the abandoned
+  // Download-button click navigates the browser into downloading the file
+  // itself. The site also injects an ad script and opens a popup on click —
+  // both are pure noise here, so the click is skipped entirely.
+  await page.evaluate(() => {
+    window.open = () => null;
+    if (window.__kdlWrapped) return;
+    window.__kdlWrapped = true;
+    window.__kdl = null;
+    window.__kdlTitle = "";
+    const orig = window.download;
+    window.download = function (e, t, o, r) {
+      window.__kdl = e + "&v=" + t + "&f=" + o + "&r=" + window.location.hostname;
+      if (r) window.__kdlTitle = r; // the site reveals the title in this arg
+      return orig.apply(this, arguments);
+    };
+  });
+  try {
+    await page.type("#video", target, { delay: 20 });
+    // MP3 rides as the page default; the app wants video, so press MP4.
+    await page.$$eval(".form__formats button", (btns) => {
+      const mp4 = btns.find((b) => (b.textContent || "").trim().toLowerCase() === "mp4");
+      if (mp4) mp4.click();
+    });
+    await page.click(`.form__actions button[type="submit"]`);
+    // Fresh MP4 conversions can take a while; the wrap only fires once the
+    // site decides the file is ready.
+    const deadline = Date.now() + 150000;
+    while (Date.now() < deadline && !(await page.evaluate(() => window.__kdl || null))) {
+      await new Promise((r2) => setTimeout(r2, 2000));
+    }
+    const direct = await page.evaluate(() => window.__kdl || null);
+    if (!direct || !/^https?:\/\//.test(direct)) return null;
+    // The site's progress path calls `download(..., !1)` — no title in the
+    // args — but it always renders the title into the form's title line.
+    const title = await page.evaluate(
+      () => window.__kdlTitle || (document.querySelector(".form__title") && document.querySelector(".form__title").textContent) || ""
+    );
+    // One more risk: a direct link the site hands out can be useless (an
+    // etacloud node that answers error:2 instead of video bytes, or a page
+    // that needs session headers). Probe with a 1KB Range GET — a real video
+    // answers 206/binary, a dead link answers JSON or 4xx.
+    try {
+      const probe = await fetch(direct, {
+        headers: {
+          "User-Agent": UA,
+          Referer: Y2MATE,
+          Origin: "https://y2mate.gs",
+          Range: "bytes=0-1024",
+        },
+        signal: AbortSignal.timeout(20000),
+        redirect: "follow",
+      });
+      if (!probe.ok) return null;
+      const ct = probe.headers.get("content-type") || "";
+      if (/json|text\//i.test(ct)) return null;
+      if (probe.status === 206 || /video|octet-stream|mp4/i.test(ct)) return { url: direct, title };
+      return null;
+    } catch {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+const ADAPTERS = [
+  { name: "y2mate", referer: "https://y2mate.gs/", origin: "https://y2mate.gs", run: viaY2mate },
+  { name: "9xbuddy", referer: "https://9xbuddy.com/", run: via9xbuddy },
+];
 
 // Returns { url, via } or null. Never throws — the caller always has a fallback.
 async function convertViaWeb(target) {
   const hit = cache.get(target);
   if (hit && Date.now() - hit.ts < CACHE_MS)
-    return { url: hit.link, via: hit.via, headers: hit.headers, cached: true };
+    return { url: hit.link, via: hit.via, headers: hit.headers, title: hit.title || "", cached: true };
   if (busy) return null; // one tab at a time on a 2-core box
   busy = true;
   let page = null;
@@ -103,27 +187,32 @@ async function convertViaWeb(target) {
     );
     // Images and fonts are pure cost here — the link is in the DOM.
     await page.setRequestInterception(true);
-    page.on("request", (r) =>
-      /image|font|media/.test(r.resourceType()) ? r.abort() : r.continue()
-    );
+    page.on("request", (r) => {
+      if (r.isInterceptResolutionHandled()) return;
+      /image|font|media/.test(r.resourceType()) ? r.abort() : r.continue();
+    });
     for (const a of ADAPTERS) {
       let link = null;
       try {
         link = await a.run(page, target);
       } catch {}
       if (!link) continue;
+      const url = typeof link === "string" ? link : link.url;
+      const title = typeof link === "string" ? "" : link.title || "";
+      if (!url) continue;
       // The link alone is not enough: the converter's proxy answers 403 to a
       // bare request and 200 to one carrying the session that produced it
       // (verified both ways). So the session travels with the link — the phone
       // sets these on its download and still pulls the bytes itself, which is
       // the whole point of handing out a link instead of streaming.
-      let headers = { "User-Agent": UA, Referer: "https://9xbuddy.com/" };
+      let headers = { "User-Agent": UA, Referer: a.referer || "https://9xbuddy.com/" };
+      if (a.origin) headers.Origin = a.origin;
       try {
         const ck = (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; ");
         if (ck) headers.Cookie = ck;
       } catch {}
-      cache.set(target, { link, via: a.name, headers, ts: Date.now() });
-      return { url: link, via: a.name, headers };
+      cache.set(target, { link: url, via: a.name, headers, title, ts: Date.now() });
+      return { url, via: a.name, headers, title };
     }
     return null;
   } catch {

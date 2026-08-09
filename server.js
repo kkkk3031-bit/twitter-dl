@@ -579,6 +579,51 @@ app.get("/api/convert", rateLimit(10), async (req, res) => {
   });
 });
 
+// YouTube MP4 the way the KDL app's own flow was born: drive y2mate.gs in a
+// headless browser, press the MP4 format button (its default is MP3), press
+// Download, and hand the phone the direct link the site produces — the phone
+// pulls the bytes itself, nothing streams through this box. That is the
+// "trick" the site does with a human, done with a browser.
+// direct=1 → { ok, url, via, headers }; otherwise the file is streamed through
+// the VPS so the web UI can download it without session headers.
+app.get("/api/ytmp4", rateLimit(4), async (req, res) => {
+  const u = String(req.query.url || "");
+  const m = u.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|live\/|embed\/)|youtu\.be\/)([\w-]{11})/);
+  if (!m) return res.status(400).json({ error: "Not a valid YouTube link" });
+  const id = m[1];
+  const target = `https://www.youtube.com/watch?v=${id}`;
+  const wantJson = req.query.direct === "1";
+  // One tab at a time on a 2-core box; a busy converter is a temporary
+  // condition, so wait for it instead of failing on the first collision.
+  let r = null;
+  for (let i = 0; i < 5 && !r; i++) {
+    r = await convertViaWeb(target);
+    if (!r && i < 4) await new Promise((s) => setTimeout(s, 5000));
+  }
+  if (!r) {
+    return res.status(502).json({ error: "y2mate conversion failed — try again in a minute." });
+  }
+  const name = `youtube-${id}.mp4`;
+  if (wantJson) return res.json({ ok: true, url: r.url, via: r.via, headers: r.headers, title: r.title || "" });
+  try {
+    const dl = await fetch(r.url, {
+      headers: { ...r.headers, Range: req.headers.range || "bytes=0-" },
+      signal: AbortSignal.timeout(180000),
+    });
+    if (!dl.ok && dl.status !== 206)
+      return res.status(502).json({ error: `y2mate link failed (HTTP ${dl.status})` });
+    const ct = dl.headers.get("content-type") || "video/mp4";
+    res.status(dl.status);
+    res.setHeader("Content-Type", ct);
+    res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+    for (const k of ["content-length", "content-range", "accept-ranges"])
+      if (dl.headers.get(k)) res.setHeader(k, dl.headers.get(k));
+    return dl.body.pipe(res);
+  } catch (e) {
+    return res.status(502).json({ error: `y2mate stream failed: ${e.message}` });
+  }
+});
+
 app.get("/api/tiktok", rateLimit(15), (req, res) => {
   const url = siteUrl(req.query.url, /(^|\.)tiktok\.com$/i);
   if (!url) return res.status(400).json({ error: "Not a valid TikTok link" });

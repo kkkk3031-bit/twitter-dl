@@ -33,7 +33,13 @@ function rateLimit(max) {
     // IP (x-forwarded-for is ignored for them the moment it can be spoofed).
     const remote = req.ip;
     if (remote === "127.0.0.1" || remote === "::1" || remote === "72.60.89.132" || remote === "::ffff:72.60.89.132") return next();
-    const ip = (req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || remote).replace("::ffff:", "");
+    // req.ip can be undefined (e.g. scanners/bots that connect and drop the
+    // socket immediately) — that undefined used to reach .replace() below,
+    // which crashed the whole process (confirmed in server.log: the stack
+    // trace is immediately followed by the watchdog failing to get a health
+    // response), taking every route incl. /api/tiktok down for up to 10min
+    // until the cron watchdog restarted it.
+    const ip = (req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || remote || "unknown").replace("::ffff:", "");
     const key = ip + "|" + req.path;
     const now = Date.now();
     const h = hits.get(key);

@@ -733,6 +733,20 @@ async function igPhotos(req, res, url) {
   }
 }
 
+// Append a log line, keeping the file from growing forever — every check-in
+// from every phone lands here with no cap otherwise. Trims to the newest
+// half once it crosses 2MB, same shape as the app's own in-memory log cap.
+function appendCapped(file, line) {
+  try {
+    const st = fs.statSync(file);
+    if (st.size > 2 * 1024 * 1024) {
+      const lines = fs.readFileSync(file, "utf8").split("\n");
+      fs.writeFileSync(file, lines.slice(-Math.floor(lines.length / 2)).join("\n"));
+    }
+  } catch { /* file doesn't exist yet — nothing to trim */ }
+  fs.appendFileSync(file, line);
+}
+
 // The app calls this on every start with the versionCode it is actually running.
 // The server does the comparison and logs the check-in, so "is that phone on the
 // latest build?" is answerable here instead of guessed. Falls back gracefully:
@@ -747,8 +761,11 @@ app.get("/api/kdl-check", rateLimit(60), (req, res) => {
   const vc = parseInt(req.query.vc, 10) || 0;
   const upToDate = vc >= (latest.versionCode || 0);
   try {
-    fs.appendFileSync(path.join(process.env.HOME, ".cache", "kdl-checkins.log"),
-      `${new Date().toISOString()} vc=${vc} vn=${req.query.vn || "?"} latest=${latest.versionCode} ` +
+    // vn is client-supplied and lands raw in a log line — strip anything that
+    // could forge a fake line (newlines/control chars) before it gets there.
+    const vn = String(req.query.vn || "?").replace(/[\r\n\x00-\x1f]/g, "").slice(0, 32);
+    appendCapped(path.join(process.env.HOME, ".cache", "kdl-checkins.log"),
+      `${new Date().toISOString()} vc=${vc} vn=${vn} latest=${latest.versionCode} ` +
       `${upToDate ? "uptodate" : "OUTDATED"} ip=${req.ip}\n`);
   } catch (e) { /* logging must never break the check */ }
   res.json({

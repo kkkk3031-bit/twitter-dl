@@ -292,6 +292,11 @@ async function fetchCommentsNoLogin(id, handle, opts = {}) {
   const deep = opts.deep !== false;
   const hit = cache.get(`${id}|${deep ? "deep" : "fast"}`);
   if (hit && Date.now() - hit.ts < CACHE_MS) return hit.data;
+  // `busy` was tracked but never actually gated a second caller — unlike
+  // converters.js's identical flag, this let concurrent /api/comments calls
+  // stack multiple Puppeteer scrapes (2 tabs each, up to 60s) on the same
+  // 2-core box at once. One conversation walk at a time, same as converters.js.
+  if (busy) return { ok: false, reason: "busy — try again shortly" };
 
   busy = true;
   const tried = [];

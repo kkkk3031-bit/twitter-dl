@@ -225,7 +225,7 @@ function renderVideoSite(url, site) {
 
 function render(d) {
   $("who").innerHTML = d.author
-    ? `<img src="${d.author.avatar||""}" onerror="this.style.display='none'"/><div><div class="n">${esc(d.author.name||"")}</div><div class="h">@${esc(d.author.handle||"")}</div></div>`
+    ? `<img src="${esc(d.author.avatar||"")}" onerror="this.style.display='none'"/><div><div class="n">${esc(d.author.name||"")}</div><div class="h">@${esc(d.author.handle||"")}</div></div>`
     : "";
   $("text").textContent = d.text || "(no text)";
   const dt = d.created_at ? new Date(d.created_at).toLocaleString() : "?";

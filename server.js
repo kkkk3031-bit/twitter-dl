@@ -533,6 +533,47 @@ function siteLabel(u) {
   }
 }
 
+// Sites yt-dlp only ever serves as audio. -f mp4/best against these picks the
+// closest thing to a "video" stream it can find — on SoundCloud that's an HLS
+// aac_160k .m3u8 playlist, not a downloadable file, so the phone saves a text
+// manifest with a .mp3 name and the "download" is silently broken. bestaudio
+// gets the real progressive/aac file instead.
+const AUDIO_HOST = /^(?:.*\.)?(soundcloud\.com|bandcamp\.com|mixcloud\.com)$/i;
+
+// Spotify never serves the audio itself (DRM) — yt-dlp has no extractor for
+// open.spotify.com at all. The only way to "convert" a Spotify link is to
+// resolve it to a track title via Spotify's own oEmbed (no auth needed, works
+// for any public track/album/playlist/episode link) and then pull that same
+// audio from YouTube through the existing pipeline.
+const SPOTIFY_HOST = /^(?:.*\.)?open\.spotify\.com$/i;
+
+async function spotifyTrackTitle(url) {
+  const r = await fetch("https://open.spotify.com/oembed?url=" + encodeURIComponent(url), {
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!r.ok) throw new Error(`oEmbed HTTP ${r.status}`);
+  const j = await r.json();
+  const title = String(j.title || "").trim();
+  if (!title) throw new Error("no title from Spotify");
+  return title;
+}
+
+// Resolve a Spotify link to a direct audio URL by searching YouTube for the
+// same track title and asking yt-dlp for its best audio stream — same shape
+// as the /api/convert yt-dlp tier, so the app's normal audio-site path can
+// hand it straight to the phone.
+function resolveSpotifyToAudio(title) {
+  return new Promise((resolve, reject) => {
+    const args = ["ytsearch1:" + title, "-g", "-f", "bestaudio[protocol^=http]/bestaudio", "--no-playlist", "--no-warnings"];
+    if (fs.existsSync(YT_COOKIES)) args.push("--cookies", YT_COOKIES);
+    execFile(YTDLP, args, { timeout: 45000 }, (err, stdout) => {
+      const direct = String(stdout || "").trim().split("\n")[0];
+      if (!err && /^https:\/\//.test(direct)) return resolve(direct);
+      reject(err || new Error("no result"));
+    });
+  });
+}
+
 // Same trick the app already uses for YouTube and Instagram: ask for the signed
 // direct link first (~1s, the phone then pulls the bytes straight from the
 // source CDN and this box carries none of it), and only stream through the VPS
@@ -579,9 +620,42 @@ app.get("/api/convert", rateLimit(10), async (req, res) => {
 
   const tryBrowser = () => convertBridge(res, url, site, wantJson);
 
+  // Spotify: no extractor exists, so it never reaches the yt-dlp tier below —
+  // resolve the track title first, then pull the same song's audio from
+  // YouTube. Only track/album/playlist/episode links carry a resolvable
+  // title; a bare profile link (/user/...) has no single track to fetch.
+  let hostname = "";
+  try { hostname = new URL(url).hostname; } catch { /* already validated above */ }
+  if (SPOTIFY_HOST.test(hostname)) {
+    if (!/\/(track|album|playlist|episode)\//.test(new URL(url).pathname)) {
+      return res.status(400).json({
+        error: "That's a Spotify profile/link, not a track — paste a track link.",
+      });
+    }
+    try {
+      const title = await spotifyTrackTitle(url);
+      const direct = await resolveSpotifyToAudio(title);
+      if (!(await publicUrl(direct))) throw new Error("resolved link failed safety check");
+      if (wantJson) return res.json({ ok: true, url: direct, via: "spotify→youtube", site: "Spotify", title });
+      return res.redirect(302, direct);
+    } catch (e) {
+      return res.status(502).json({ error: `Spotify: couldn't resolve track (${e.message})` });
+    }
+  }
+
   // Tier 1: yt-dlp's own signed link. It resolves the host itself, so what it
   // returns is checked before it is passed on rather than trusted outright.
-  const args = [url, "-g", "-f", "mp4/best", "--no-playlist", "--no-warnings"];
+  // Audio-only hosts (SoundCloud etc.) ask for bestaudio — mp4/best against
+  // them returns an HLS .m3u8 playlist instead of a downloadable file.
+  // "bestaudio" alone still picks HLS (m3u8) over a plain progressive file
+  // when the HLS variant has a higher bitrate — SoundCloud offers both for
+  // the same track, and the app can't download an m3u8 as a file. Prefer any
+  // http(s)-protocol stream first; HLS is the fallback only if that's all
+  // there is (some tracks are HLS-only).
+  const format = AUDIO_HOST.test(hostname)
+    ? "bestaudio[protocol^=http]/bestaudio"
+    : "mp4/best";
+  const args = [url, "-g", "-f", format, "--no-playlist", "--no-warnings"];
   execFile(YTDLP, args, { timeout: 45000 }, async (err, stdout) => {
     const direct = String(stdout || "").trim().split("\n")[0];
     if (!err && /^https:\/\//.test(direct) && (await publicUrl(direct))) {

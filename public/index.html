@@ -218,9 +218,19 @@ function renderVideoSite(url, site) {
   $("text").textContent = site.label + " video";
   $("meta").innerHTML = "";
   $("imgs").innerHTML = "";
-  $("btns").innerHTML = `<a href="${site.api}?url=${encodeURIComponent(url)}">Download video</a>`;
-  $("note").innerHTML = `The MP4 is fetched server-side, so it can take a few seconds to start. Private, removed, or region-locked videos can't be downloaded, and photo-only posts have nothing to save. <span class="rtl">قد يستغرق التحميل بضع ثوانٍ</span>`;
+  const href = `${site.api}?url=${encodeURIComponent(url)}`;
+  $("btns").innerHTML = `<a href="${href}">Download video</a>`;
+  $("note").innerHTML = `Starting the download automatically — the file is fetched server-side, so it can take a few seconds. Didn't start? Use the link above. Private, removed, or region-locked videos can't be downloaded, and photo-only posts have nothing to save. <span class="rtl">التحميل يبدأ تلقائيًا خلال ثوانٍ</span>`;
   $("card").style.display = "block";
+  // Auto-start: the endpoint now streams the file with a real
+  // Content-Disposition, so a hidden click triggers the browser's normal
+  // save dialog immediately instead of making the user find and tap the link.
+  const a = document.createElement("a");
+  a.href = href;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => a.remove(), 1000);
 }
 
 function render(d) {

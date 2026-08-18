@@ -472,6 +472,23 @@ function ytdlpToClient(res, url, site, onNoVideo, onFail) {
   });
 }
 
+// A resolved direct link is often the source's own CDN (SoundCloud, YouTube
+// audio, etc.) serving plain audio/mpeg or video/mp4 with no Content-
+// Disposition header — a browser navigated straight at it (a bare 302, which
+// this endpoint used to do) plays it inline in the tab instead of downloading
+// it. Streaming it through this box with an explicit "attachment" header is
+// what actually makes "Open in browser" behave like a download.
+async function streamDirectDownload(res, direct, name, headers) {
+  const up = await fetchPublic(direct, headers || {});
+  if (!up.ok) throw new Error(String(up.status));
+  res.setHeader("Content-Type", up.headers.get("content-type") || "application/octet-stream");
+  res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+  const len = up.headers.get("content-length");
+  if (len) res.setHeader("Content-Length", len);
+  const { Readable } = require("stream");
+  return Readable.fromWeb(up.body).pipe(res);
+}
+
 // Tiers 2 and 3 of the converter, reusable: drive a headless browser through an
 // online converter for what yt-dlp cannot extract, and carry the bytes ourselves
 // only if that fails too. Every endpoint that can hit an extractor gap routes
@@ -596,6 +613,25 @@ app.get("/api/media", rateLimit(15), (req, res) => {
   ytdlpToClient(res, url, site, null, bridge);
 });
 
+// The app already resolved a direct link itself (via /api/convert&direct=1,
+// ytmp4, etc.) and normally streams it straight from the phone with its own
+// downloader. "Open ↗" is the fallback for when that download fails, and it
+// used to just ACTION_VIEW the raw CDN link — which plays inline in the
+// phone's browser instead of saving anything, since the source CDN sets no
+// Content-Disposition. This relays that exact link through the server once,
+// adding the "attachment" header the CDN never sends, so the fallback path
+// actually saves a file instead of only ever streaming one.
+app.get("/api/dl", rateLimit(15), async (req, res) => {
+  const u = String(req.query.u || "");
+  if (!(await publicUrl(u))) return res.status(400).json({ error: "Not a valid link" });
+  const name = String(req.query.name || "download").replace(/[\\/:*?"<>|]/g, "_");
+  try {
+    await streamDirectDownload(res, u, name);
+  } catch (e) {
+    res.status(502).json({ error: `couldn't fetch link (${e.message})` });
+  }
+});
+
 // So the app and the web UI can show the real list instead of hard-coding it.
 app.get("/api/sites", rateLimit(60), (_req, res) =>
   res.json({ ok: true, first_class: ["X / Twitter", "YouTube", "TikTok", "Instagram"], more: SITE_LIST })
@@ -637,7 +673,8 @@ app.get("/api/convert", rateLimit(10), async (req, res) => {
       const direct = await resolveSpotifyToAudio(title);
       if (!(await publicUrl(direct))) throw new Error("resolved link failed safety check");
       if (wantJson) return res.json({ ok: true, url: direct, via: "spotify→youtube", site: "Spotify", title });
-      return res.redirect(302, direct);
+      const safeName = title.replace(/[\\/:*?"<>|]/g, "_") + ".mp3";
+      return await streamDirectDownload(res, direct, safeName);
     } catch (e) {
       return res.status(502).json({ error: `Spotify: couldn't resolve track (${e.message})` });
     }
@@ -660,7 +697,14 @@ app.get("/api/convert", rateLimit(10), async (req, res) => {
     const direct = String(stdout || "").trim().split("\n")[0];
     if (!err && /^https:\/\//.test(direct) && (await publicUrl(direct))) {
       if (wantJson) return res.json({ ok: true, url: direct, via: "yt-dlp", site });
-      return res.redirect(302, direct);
+      const ext = AUDIO_HOST.test(hostname) ? "mp3" : "mp4";
+      try {
+        return await streamDirectDownload(res, direct, `${site.toLowerCase()}-${Date.now()}.${ext}`);
+      } catch {
+        return tryBrowser().catch(() =>
+          res.status(502).json({ error: `${site}: conversion failed` })
+        );
+      }
     }
     tryBrowser().catch(() =>
       res.status(502).json({ error: `${site}: conversion failed` })

@@ -95,7 +95,7 @@ async function via9xbuddy(page, target) {
 // is what makes the link serve to any IP, not just this box's.
 const Y2MATE = "https://y2mate.gs/";
 
-async function viaY2mate(page, target) {
+async function viaY2mate(page, target, format = "mp4") {
   await page.goto(Y2MATE, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
   // The site's own `download(downloadURL, vid, fmt, title)` is what builds the
   // real link when the file is ready (`e + "&v=" + t + "&f=" + o + "&r=" +
@@ -119,14 +119,16 @@ async function viaY2mate(page, target) {
   });
   try {
     await page.type("#video", target, { delay: 20 });
-    // MP3 rides as the page default; the app wants video, so press MP4.
-    await page.$$eval(".form__formats button", (btns) => {
-      const mp4 = btns.find((b) => (b.textContent || "").trim().toLowerCase() === "mp4");
-      if (mp4) mp4.click();
-    });
+    // MP3 rides as the page default; press MP4 only when video is wanted —
+    // pressing MP3 explicitly too, in case a page update ever changes that
+    // default from under us.
+    await page.$$eval(".form__formats button", (btns, fmt) => {
+      const btn = btns.find((b) => (b.textContent || "").trim().toLowerCase() === fmt);
+      if (btn) btn.click();
+    }, format);
     await page.click(`.form__actions button[type="submit"]`);
-    // Fresh MP4 conversions can take a while; the wrap only fires once the
-    // site decides the file is ready.
+    // Fresh conversions can take a while; the wrap only fires once the site
+    // decides the file is ready.
     const deadline = Date.now() + 150000;
     while (Date.now() < deadline && !(await page.evaluate(() => window.__kdl || null))) {
       await new Promise((r2) => setTimeout(r2, 2000));
@@ -156,7 +158,8 @@ async function viaY2mate(page, target) {
       if (!probe.ok) return null;
       const ct = probe.headers.get("content-type") || "";
       if (/json|text\//i.test(ct)) return null;
-      if (probe.status === 206 || /video|octet-stream|mp4/i.test(ct)) return { url: direct, title };
+      const okCt = format === "mp3" ? /audio|mpeg|octet-stream/i : /video|octet-stream|mp4/i;
+      if (probe.status === 206 || okCt.test(ct)) return { url: direct, title };
       return null;
     } catch {
       return null;
@@ -170,6 +173,48 @@ const ADAPTERS = [
   { name: "y2mate", referer: "https://y2mate.gs/", origin: "https://y2mate.gs", run: viaY2mate },
   { name: "9xbuddy", referer: "https://9xbuddy.com/", run: via9xbuddy },
 ];
+
+// YouTube MP3, driven the same way as the MP4 trick above but pressing the
+// site's MP3 format button — the only adapter with an audio mode, so this
+// skips the multi-adapter loop convertViaWeb runs and calls y2mate directly.
+// Separate cache key from convertViaWeb's (same target URL, different format
+// would otherwise collide and hand out the wrong file type).
+async function convertYoutubeMp3(target) {
+  const key = "mp3:" + target;
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.ts < CACHE_MS)
+    return { url: hit.link, via: hit.via, headers: hit.headers, title: hit.title || "", cached: true };
+  if (busy) return null; // one tab at a time on a 2-core box
+  busy = true;
+  let page = null;
+  try {
+    const b = await getBrowser();
+    page = await b.newPage();
+    await page.setUserAgent(UA.replace("X11; Linux x86_64", "X11; Linux x86_64"));
+    await page.setRequestInterception(true);
+    page.on("request", (r) => {
+      if (r.isInterceptResolutionHandled()) return;
+      /image|font|media/.test(r.resourceType()) ? r.abort() : r.continue();
+    });
+    const link = await viaY2mate(page, target, "mp3");
+    if (!link || !link.url) return null;
+    const headers = { "User-Agent": UA, Referer: Y2MATE, Origin: "https://y2mate.gs" };
+    try {
+      const ck = (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; ");
+      if (ck) headers.Cookie = ck;
+    } catch {}
+    cache.set(key, { link: link.url, via: "y2mate", headers, title: link.title || "", ts: Date.now() });
+    return { url: link.url, via: "y2mate", headers, title: link.title || "" };
+  } catch {
+    return null;
+  } finally {
+    busy = false;
+    try {
+      if (page) await page.close();
+    } catch {}
+    touchIdle();
+  }
+}
 
 // Returns { url, via } or null. Never throws — the caller always has a fallback.
 async function convertViaWeb(target) {
@@ -226,4 +271,4 @@ async function convertViaWeb(target) {
   }
 }
 
-module.exports = { convertViaWeb };
+module.exports = { convertViaWeb, convertYoutubeMp3 };

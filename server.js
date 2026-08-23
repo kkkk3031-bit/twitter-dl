@@ -8,12 +8,23 @@ const os = require("os");
 const fs = require("fs");
 const fsp = require("fs/promises");
 const { execFile } = require("child_process");
-const { convertViaWeb } = require("./converters");
+const { Readable } = require("stream");
+const { convertViaWeb, convertYoutubeMp3 } = require("./converters");
 const { fetchCommentsNoLogin } = require("./comments");
 
 const app = express();
 app.use(express.json({ limit: "256kb" }));
 app.use(express.static(path.join(__dirname, "public")));
+
+// Express 4 does not catch a rejected promise thrown inside an async route
+// handler — it reaches here as an uncaught exception and takes the whole
+// process down, every route included, not just the one that misbehaved.
+// The cron watchdog (twdl-serve ensure, */10) does bring it back, but that is
+// up to 10 minutes where TikTok/Instagram/X/everything looks "stuck" from one
+// bad request in one endpoint. Logging and staying up beats that trade every
+// time — a single request failing honestly is not worth the whole box.
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 
 // The port is reachable from the internet — keep strangers from turning this
 // into a free download farm. Cheap fixed-window limiter, no deps.
@@ -558,37 +569,51 @@ function siteLabel(u) {
 const AUDIO_HOST = /^(?:.*\.)?(soundcloud\.com|bandcamp\.com|mixcloud\.com)$/i;
 
 // Spotify never serves the audio itself (DRM) — yt-dlp has no extractor for
-// open.spotify.com at all. The only way to "convert" a Spotify link is to
-// resolve it to a track title via Spotify's own oEmbed (no auth needed, works
-// for any public track/album/playlist/episode link) and then pull that same
-// audio from YouTube through the existing pipeline.
+// open.spotify.com at all. spotsaver.net runs the whole Spotify→YouTube→MP3
+// resolve on its own servers (its own YouTube extraction, no cookies needed
+// on this end) behind three plain JSON calls — no headless browser required,
+// unlike the y2mate.gs MP4 path. Verified live 2026-08-23: title+artist
+// lookup, then a YouTube videoId match, then a signed "tunnel" link that
+// 302s straight to a real 320kbps audio/mpeg file.
 const SPOTIFY_HOST = /^(?:.*\.)?open\.spotify\.com$/i;
+const SPOTSAVER = "https://spotsaver.net";
 
-async function spotifyTrackTitle(url) {
-  const r = await fetch("https://open.spotify.com/oembed?url=" + encodeURIComponent(url), {
-    signal: AbortSignal.timeout(10000),
+async function spotsaverTrackInfo(url) {
+  const r = await fetch(`${SPOTSAVER}/api/spotify/?url=${encodeURIComponent(url)}`, {
+    headers: { "User-Agent": UA, Referer: `${SPOTSAVER}/results/` },
+    signal: AbortSignal.timeout(15000),
   });
-  if (!r.ok) throw new Error(`oEmbed HTTP ${r.status}`);
+  if (!r.ok) throw new Error(`spotsaver lookup HTTP ${r.status}`);
   const j = await r.json();
-  const title = String(j.title || "").trim();
-  if (!title) throw new Error("no title from Spotify");
-  return title;
+  const item = j.items && j.items[0];
+  if (!item || !item.title) throw new Error("no track info");
+  return { title: item.title, artist: item.artist || "" };
 }
 
-// Resolve a Spotify link to a direct audio URL by searching YouTube for the
-// same track title and asking yt-dlp for its best audio stream — same shape
-// as the /api/convert yt-dlp tier, so the app's normal audio-site path can
-// hand it straight to the phone.
-function resolveSpotifyToAudio(title) {
-  return new Promise((resolve, reject) => {
-    const args = ["ytsearch1:" + title, "-g", "-f", "bestaudio[protocol^=http]/bestaudio", "--no-playlist", "--no-warnings"];
-    if (fs.existsSync(YT_COOKIES)) args.push("--cookies", YT_COOKIES);
-    execFile(YTDLP, args, { timeout: 45000 }, (err, stdout) => {
-      const direct = String(stdout || "").trim().split("\n")[0];
-      if (!err && /^https:\/\//.test(direct)) return resolve(direct);
-      reject(err || new Error("no result"));
-    });
+async function spotsaverMp3(title, artist) {
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": UA,
+    Origin: SPOTSAVER,
+    Referer: `${SPOTSAVER}/results/`,
+  };
+  const idRes = await fetch(`${SPOTSAVER}/api/get-id/`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ title, artist }),
+    signal: AbortSignal.timeout(20000),
   });
+  const idJson = await idRes.json().catch(() => ({}));
+  if (!idRes.ok || !idJson.success || !idJson.videoId) throw new Error("no YouTube match");
+  const dlRes = await fetch(`${SPOTSAVER}/api/download/`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ videoId: idJson.videoId, format: "mp3" }),
+    signal: AbortSignal.timeout(20000),
+  });
+  const dlJson = await dlRes.json().catch(() => ({}));
+  if (!dlRes.ok || !dlJson.success || !dlJson.url) throw new Error("no download link");
+  return { url: dlJson.url, filename: dlJson.filename || `${title}.mp3` };
 }
 
 // Same trick the app already uses for YouTube and Instagram: ask for the signed
@@ -657,9 +682,12 @@ app.get("/api/convert", rateLimit(10), async (req, res) => {
   const tryBrowser = () => convertBridge(res, url, site, wantJson);
 
   // Spotify: no extractor exists, so it never reaches the yt-dlp tier below —
-  // resolve the track title first, then pull the same song's audio from
-  // YouTube. Only track/album/playlist/episode links carry a resolvable
-  // title; a bare profile link (/user/...) has no single track to fetch.
+  // resolve the track via spotsaver.net's own title/artist → YouTube → MP3
+  // pipeline instead. Only track/album/playlist/episode links carry a
+  // resolvable title; a bare profile link (/user/...) has no single track to
+  // fetch. (The old yt-dlp/ytsearch fallback was dropped: it only ever works
+  // with YT_COOKIES in place, which this box doesn't have, so it was dead
+  // weight that just added a ~45s stall before failing anyway.)
   let hostname = "";
   try { hostname = new URL(url).hostname; } catch { /* already validated above */ }
   if (SPOTIFY_HOST.test(hostname)) {
@@ -669,12 +697,12 @@ app.get("/api/convert", rateLimit(10), async (req, res) => {
       });
     }
     try {
-      const title = await spotifyTrackTitle(url);
-      const direct = await resolveSpotifyToAudio(title);
+      const { title, artist } = await spotsaverTrackInfo(url);
+      const { url: direct, filename } = await spotsaverMp3(title, artist);
       if (!(await publicUrl(direct))) throw new Error("resolved link failed safety check");
-      if (wantJson) return res.json({ ok: true, url: direct, via: "spotify→youtube", site: "Spotify", title });
-      const safeName = title.replace(/[\\/:*?"<>|]/g, "_") + ".mp3";
-      return await streamDirectDownload(res, direct, safeName);
+      if (wantJson) return res.json({ ok: true, url: direct, via: "spotsaver", site: "Spotify", title });
+      const safeName = filename.replace(/[\\/:*?"<>|]/g, "_");
+      return await streamDirectDownload(res, direct, /\.mp3$/i.test(safeName) ? safeName : `${safeName}.mp3`);
     } catch (e) {
       return res.status(502).json({ error: `Spotify: couldn't resolve track (${e.message})` });
     }
@@ -751,7 +779,50 @@ app.get("/api/ytmp4", rateLimit(4), async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
     for (const k of ["content-length", "content-range", "accept-ranges"])
       if (dl.headers.get(k)) res.setHeader(k, dl.headers.get(k));
-    return dl.body.pipe(res);
+    return Readable.fromWeb(dl.body).pipe(res);
+  } catch (e) {
+    return res.status(502).json({ error: `y2mate stream failed: ${e.message}` });
+  }
+});
+
+// YouTube MP3, same y2mate.gs browser trick as /api/ytmp4 just pressing the
+// MP3 format button instead — fixes /api/mp3's etacloud-direct call, which
+// YouTube's bot wall blocks from this box's datacenter IP the same way it
+// blocks a bare yt-dlp run. The retry loop is what /api/ytmp4 already does
+// for the same reason: the converter is a single shared headless tab, so a
+// call that lands mid another job isn't a real failure, just busy — worth
+// waiting out instead of bouncing the app straight to an error.
+app.get("/api/ytmp3", rateLimit(4), async (req, res) => {
+  const u = String(req.query.url || "");
+  const m = u.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|live\/|embed\/)|youtu\.be\/)([\w-]{11})/);
+  if (!m) return res.status(400).json({ error: "Not a valid YouTube link" });
+  const id = m[1];
+  const target = `https://www.youtube.com/watch?v=${id}`;
+  const wantJson = req.query.direct === "1";
+  let r = null;
+  for (let i = 0; i < 5 && !r; i++) {
+    r = await convertYoutubeMp3(target);
+    if (!r && i < 4) await new Promise((s) => setTimeout(s, 5000));
+  }
+  if (!r) {
+    return res.status(502).json({ error: "y2mate conversion failed — try again in a minute." });
+  }
+  const name = (r.title ? r.title.replace(/[\\/:*?"<>|]/g, "_") : `youtube-${id}`) + ".mp3";
+  if (wantJson) return res.json({ ok: true, url: r.url, via: r.via, headers: r.headers, title: r.title || "" });
+  try {
+    const dl = await fetch(r.url, {
+      headers: { ...r.headers, Range: req.headers.range || "bytes=0-" },
+      signal: AbortSignal.timeout(180000),
+    });
+    if (!dl.ok && dl.status !== 206)
+      return res.status(502).json({ error: `y2mate link failed (HTTP ${dl.status})` });
+    const ct = dl.headers.get("content-type") || "audio/mpeg";
+    res.status(dl.status);
+    res.setHeader("Content-Type", ct);
+    res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+    for (const k of ["content-length", "content-range", "accept-ranges"])
+      if (dl.headers.get(k)) res.setHeader(k, dl.headers.get(k));
+    return Readable.fromWeb(dl.body).pipe(res);
   } catch (e) {
     return res.status(502).json({ error: `y2mate stream failed: ${e.message}` });
   }
